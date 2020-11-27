@@ -1,0 +1,55 @@
+;
+; ForensicsCollector.inf
+;
+; Developed by Nina Tessler and Kostya Zhuruev
+;
+
+[Version]
+    Signature="$WINDOWS NT$"
+    Class=System
+    ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+    Provider=%ManufacturerName%
+    DriverVer=
+    CatalogFile=ForensicsCollector.cat
+    PnpLockDown=1
+
+[DestinationDirs]
+    DefaultDestDir      = 12                              ; %WinDir%\System32\Drivers
+    ForensicsCollector.DriverFiles = 12                   ; %WinDir%\System32\Drivers
+
+[SourceDisksNames]
+    1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+   ForensicsCollector.sys = 1,,
+
+[DefaultInstall]
+    OptionDesc = %ForensicsCollectorServiceDesc%
+    CopyFiles  = ForensicsCollector.DriverFiles
+
+[DefaultInstall.Services]
+    AddService = %ForensicsCollectorServiceName%,,ForensicsCollector.Service
+
+[DefaultUninstall]
+    DelFiles = ForensicsCollector.DriverFiles
+
+[DefaultUninstall.Services]
+    DelService = %ForensicsCollectorServiceName%,0x200               ; SPSVCINST_STOPSERVICE
+
+[ForensicsCollector.DriverFiles]
+    ForensicsCollector.sys,,,0x00000040                              ; COPYFLG_OVERWRITE_OLDER_ONLY
+
+[ForensicsCollector.Service]
+    DisplayName   = %ForensicsCollectorServiceName%
+    Description   = %ForensicsCollectorServiceDesc%
+    ServiceType   = 1                                     ; SERVICE_KERNEL_DRIVER
+    StartType     = 3                                     ; SERVICE_DEMAND_START
+    ErrorControl  = 1                                     ; SERVICE_ERROR_NORMAL
+    ServiceBinary = %12%\ForensicsCollector.sys           ; %WinDir%\System32\Drivers\ForensicsCollector.sys
+
+[Strings]
+    ManufacturerName="ForensicsCollector"
+    ClassName=""
+    DiskName="ForensicsCollector Source Disk"
+    ForensicsCollectorServiceDesc = "Forensics Collector Driver"
+    ForensicsCollectorServiceName = "ForensicsCollector"
