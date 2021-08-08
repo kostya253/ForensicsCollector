@@ -34,6 +34,11 @@
 #include <wdm.h>
 #include <fltKernel.h>
 
+//
+// ETW events
+//
+#include "ForensicsCollector.h"
+
 #pragma region Definitions
 //
 // Defines
@@ -63,6 +68,18 @@
 
 #define MAX_EVENTS 5000
 
+#define NT_DEVICE_NAME      L"\\Device\\ForensicsCollector"
+#define DOS_DEVICE_NAME     L"\\DosDevices\\ForensicsCollector"
+
+#define GET_FLTMGR_EVENT   CTL_CODE( FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define GET_CREATE_EVENT   CTL_CODE( FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define GET_LOAD_EVENT     CTL_CODE( FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define GET_OBJECT_EVENT   CTL_CODE( FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define GET_REGISTRY_EVENT CTL_CODE( FILE_DEVICE_UNKNOWN, 0x905, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define GET_ALL_MISSES     CTL_CODE( FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define SET_SIM_PS_ID      CTL_CODE( FILE_DEVICE_UNKNOWN, 0x907, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define CLS_SIM_DATA       CTL_CODE( FILE_DEVICE_UNKNOWN, 0x908, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+
 #pragma endregion
 
 #pragma region Function Declarations
@@ -71,6 +88,15 @@
 //
 DRIVER_INITIALIZE DriverEntry;
 VOID DriverUnloadFunction(PDRIVER_OBJECT DriverObject);
+
+
+_Dispatch_type_(IRP_MJ_CREATE)
+_Dispatch_type_(IRP_MJ_CLOSE)
+DRIVER_DISPATCH CreateCloseDispatch;
+
+_Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
+DRIVER_DISPATCH DeviceControlDispatch;
+
 #pragma endregion
 
 #pragma region Statistics
@@ -84,62 +110,73 @@ HANDLE SimulationProcessId = 0;
 #define FORENSICS_STATS_TAG 'ssPF'
 
 //
+// See https://docs.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps
+//
+#define TimeOpStart() {                                             \
+    LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
+    LARGE_INTEGER Frequency;                                        \
+    StartingTime = KeQueryPerformanceCounter(&Frequency);           \
+
+#define TimeOpStop(s)                                                \
+    EndingTime = KeQueryPerformanceCounter(NULL);                   \
+    ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
+    ElapsedMicroseconds.QuadPart *= 1000000;                        \
+    ElapsedMicroseconds.QuadPart /= Frequency.QuadPart;             \
+    s = ElapsedMicroseconds.QuadPart;                               \
+    }                                                               
+
+//
 // Filter Manager event
 //
 
 typedef struct _FilterManagerEvent
 {
-    LARGE_INTEGER StartTime;
-    LARGE_INTEGER EndTime;
+    LARGE_INTEGER ElapsedMicroseconds;
 } FilterManagerEvent, *PFilterManagerEvent;
 LONG FilterManagerEventIndex = 0;
 LONG FilterManagerMisses = 0;
-PFilterManagerEvent FilterManagerEvents[MAX_EVENTS] = { 0 };
+FilterManagerEvent FilterManagerEvents[MAX_EVENTS] = { 0 };
 
 //
 // Create process event
 //
 typedef struct _CreationEvent
 {
-    LARGE_INTEGER  StartTime;
-    LARGE_INTEGER  EndTime;
+    LARGE_INTEGER ElapsedMicroseconds;
 } CreationEvent, * PCreationEvent;
 LONG CreationEventIndex = 0;
 LONG CreationEventMisses = 0;
-PCreationEvent CreationEvents[MAX_EVENTS] = { 0 };
+CreationEvent CreationEvents[MAX_EVENTS] = { 0 };
 
 //
 // Load image event
 //
 typedef struct _LoadImageEvent
 {
-    LARGE_INTEGER  StartTime;
-    LARGE_INTEGER  EndTime;
+    LARGE_INTEGER ElapsedMicroseconds;
 } LoadImageEvent, * PLoadImageEvent;
 LONG LoadEventIndex = 0;
 LONG LoadEventMisses = 0;
-PLoadImageEvent LoadImageEvents[MAX_EVENTS] = { 0 };
+LoadImageEvent LoadImageEvents[MAX_EVENTS] = { 0 };
 
 //
 // Object manager event
 //
 typedef struct _ObjectManagerEvent
 {
-    LARGE_INTEGER  StartTime;
-    LARGE_INTEGER  EndTime;
+    LARGE_INTEGER ElapsedMicroseconds;
 } ObjectManagerEvent, * PObjectManagerEvent;
 LONG ObjectManagerEventIndex = 0;
 LONG ObjectManagerMisses = 0;
-PObjectManagerEvent ObjectManagerEvents[MAX_EVENTS] = { 0 };
+ObjectManagerEvent ObjectManagerEvents[MAX_EVENTS] = { 0 };
 
 typedef struct _RegistryManagerEvent
 {
-    LARGE_INTEGER  StartTime;
-    LARGE_INTEGER  EndTime;
+    LARGE_INTEGER ElapsedMicroseconds;
 } RegistryManagerEvent, * PRegistryManagerEvent;
 LONG RegistryManagerEventIndex = 0;
 LONG RegistryManagerMisses = 0;
-PRegistryManagerEvent RegistryManagerEvents[MAX_EVENTS] = { 0 };
+RegistryManagerEvent RegistryManagerEvents[MAX_EVENTS] = { 0 };
 
 
 VOID InitializeStatistics()
@@ -147,77 +184,29 @@ VOID InitializeStatistics()
     //
     // Create all stats in advance
     //
-
-    for (ULONG index = 0; index < MAX_EVENTS; ++index)
-    {
-        //
-        // Create Filter Manager events stats placeholders
-        //
-        FilterManagerEvents[index] = ExAllocatePoolWithTag(NonPagedPool, sizeof(FilterManagerEvent), FORENSICS_STATS_TAG);
-
-        if (FilterManagerEvents[index] == NULL)
-        {
-            DbgPrint("%s Failed to allocate memory for event\n", __FUNCTION__);
-            ASSERT(0);
-        }
-
-        RtlZeroMemory(FilterManagerEvents[index], sizeof(FilterManagerEvent));
-
-        //
-        // Create create process events placeholders
-        //
-        CreationEvents[index] = ExAllocatePoolWithTag(NonPagedPool, sizeof(CreationEvent), FORENSICS_STATS_TAG);
-
-        if (CreationEvents[index] == NULL)
-        {
-            DbgPrint("%s Failed to allocate event\n", __FUNCTION__);
-            ASSERT(0);
-        }
-
-        RtlZeroMemory(CreationEvents[index], sizeof(CreationEvent));
-
-        //
-        // Load Image Notify routine events placeholders
-        //
-
-        LoadImageEvents[index] = ExAllocatePoolWithTag(NonPagedPool, sizeof(LoadImageEvent), FORENSICS_STATS_TAG);
-
-        if (LoadImageEvents[index] == NULL)
-        {
-            DbgPrint("%s Failed to allocate event\n", __FUNCTION__);
-            ASSERT(0);
-        }
-
-        RtlZeroMemory(LoadImageEvents[index], sizeof(LoadImageEvent));
-
-        //
-        // Object create/duplicate events place holders
-        //
-        ObjectManagerEvents[index] = ExAllocatePoolWithTag(NonPagedPool, sizeof(ObjectManagerEvent), FORENSICS_STATS_TAG);
-
-        if (ObjectManagerEvents[index] == NULL)
-        {
-            DbgPrint("%s Failed to allocate event\n", __FUNCTION__);
-            ASSERT(0);
-        }
-
-        RtlZeroMemory(ObjectManagerEvents[index], sizeof(ObjectManagerEvent));
-
-        //
-        // Registry callbacks events placeholders
-        //
-        RegistryManagerEvents[index] = ExAllocatePoolWithTag(NonPagedPool, sizeof(RegistryManagerEvent), FORENSICS_STATS_TAG);
-
-        if (RegistryManagerEvents[index] == NULL)
-        {
-            DbgPrint("%s Failed to allocate event\n", __FUNCTION__);
-            ASSERT(0);
-        }
-
-        RtlZeroMemory(RegistryManagerEvents[index], sizeof(RegistryManagerEvent));
-    }
+    // Allocate additional stat data in case it's needed
 }
 
+VOID CleanStatisticalData()
+{
+    //
+    // Reset events for subsequent collection
+    //
+    RtlZeroMemory(FilterManagerEvents, sizeof(FilterManagerEvents));
+    RtlZeroMemory(CreationEvents, sizeof(CreationEvents));
+    RtlZeroMemory(LoadImageEvents, sizeof(LoadImageEvents));
+    RtlZeroMemory(RegistryManagerEvents, sizeof(RegistryManagerEvents));
+    RtlZeroMemory(ObjectManagerEvents, sizeof(ObjectManagerEvents));
+}
+
+// TODO (Nina) run verifier on unload of the driver to ensure all resources were freed
+VOID ReleaseStatistics()
+{
+    //
+    // Create all stats in advance
+    //
+    // Fill in case you decide to allocate anything in the initialize function
+}
 #pragma endregion
 
 #pragma region CodeIntegrity
@@ -359,15 +348,12 @@ PreOperationCallback(
     }
 
     // TODO (Nina): are we really ok here? check if we are racing
-    PFilterManagerEvent record;
     LONG CurrentEventIndex = InterlockedIncrement(&FilterManagerEventIndex);
 
-    if (CurrentEventIndex < MAX_EVENTS)
-        record = FilterManagerEvents[CurrentEventIndex];
-    else 
+    if (CurrentEventIndex > MAX_EVENTS)
         goto Exit;
 
-    record->StartTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStart();
 
     DbgPrint("--> %s\n", __FUNCTION__);
 
@@ -395,13 +381,19 @@ PreOperationCallback(
         if (NULL != FileNameToLog)
         {
             DbgPrint("\tPid: 0x%p, FileName: %wZ\n", PsGetCurrentProcessId(), FileNameToLog->Buffer);
+            
+            //
+            // ETW event saving
+            //
+            EventWriteFileOp((ULONG64)PsGetCurrentProcessId(), (ULONG64)PsGetCurrentThreadId(), FileNameToLog->Buffer);
         }
 
         FltReleaseFileNameInformation(FileNameInfo);
     }
 
     DbgPrint("<-- %s\n", __FUNCTION__);
-    record->EndTime = KeQueryPerformanceCounter(NULL);
+    
+    TimeOpStop(FilterManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 
 Exit:
     return Status;
@@ -509,17 +501,14 @@ PsCreateProcessNotifyRoutineEx2Callback(
         goto Exit;
     }
 
-    PCreationEvent record;
     LONG CurrentEventIndex = InterlockedIncrement(&CreationEventIndex);
 
-    if (CurrentEventIndex < MAX_EVENTS)
-        record = CreationEvents[CurrentEventIndex];
-    else
+    if (CurrentEventIndex > MAX_EVENTS)
         goto Exit;
 
     DbgPrint("--> %s\n", __FUNCTION__);
 
-    record->StartTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStart();
 
     if (CreateInfo) // Process Created
     {
@@ -551,6 +540,19 @@ PsCreateProcessNotifyRoutineEx2Callback(
         if (CreateInfo->CommandLine != NULL)
         {
             DbgPrint("\tPid: 0x%p, Command line: %wZ\n", ProcessId, CreateInfo->CommandLine);
+
+            //
+            // ETW Event
+            //
+            EventWriteCreateOp(
+                (ULONG64)PsGetCurrentProcessId(),
+                (ULONG64)PsGetCurrentThreadId(),
+                (ULONG64)Process,
+                (ULONG64)CreateInfo->ParentProcessId,
+                TRUE, // Create Process
+                (PCWSTR)CreateInfo->CommandLine->Buffer,
+                (PCWSTR)CreateInfo->ImageFileName->Buffer
+            );
         }
 
         DbgPrint("\tPid: 0x%p, Image Name: %wZ\n", ProcessId, CreateInfo->ImageFileName);
@@ -558,14 +560,27 @@ PsCreateProcessNotifyRoutineEx2Callback(
     else // Process Terminated
     {
         DbgPrint("\tProcess Exit: EPROCESS: 0x%p, Pid: 0x%p", Process, ProcessId);
+
+        //
+        // ETW Event
+        //
+        EventWriteCreateOp(
+            (ULONG64)PsGetCurrentProcessId(),
+            (ULONG64)PsGetCurrentThreadId(),
+            (ULONG64)Process,
+            0,
+            FALSE, // Create Process
+            NULL,
+            NULL
+        );
     }
 
     DbgPrint("<-- %s\n", __FUNCTION__);
 
-    record->EndTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStop(CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 
 Exit:
-
+    return;
 }
 
 #pragma endregion
@@ -593,29 +608,35 @@ LoadImageNotifyRoutineCallback(
         goto Exit;
     }
 
-    PLoadImageEvent record;
     LONG CurrentEventIndex = InterlockedIncrement(&LoadEventIndex);
 
-    if (CurrentEventIndex < MAX_EVENTS)
-        record = LoadImageEvents[CurrentEventIndex];
-    else
+    if (CurrentEventIndex > MAX_EVENTS)
         goto Exit;
 
+    TimeOpStart();
+
     DbgPrint("--> %s\n", __FUNCTION__);
-    
-    record->StartTime = KeQueryPerformanceCounter(NULL);
 
     if (FullImageName)
     {
         DbgPrint("\t%wZ loaded in process 0x%p\n", FullImageName, ProcessId);
+
+        //
+        // ETW Event
+        //
+        EventWriteLoadOp(
+            (ULONG64)PsGetCurrentProcessId(),
+            (ULONG64)PsGetCurrentThreadId(),
+            (PCWSTR)FullImageName->Buffer
+        );
     }
 
     DbgPrint("<-- %s\n", __FUNCTION__);
 
-    record->EndTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStop(LoadImageEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 
 Exit:
-    
+    return;
 }
 
 #pragma endregion
@@ -708,15 +729,12 @@ ObjectManagerPreCallback(
         goto Exit;
     }
 
-    PObjectManagerEvent record;
     LONG CurrentEventIndex = InterlockedIncrement(&ObjectManagerEventIndex);
 
-    if (CurrentEventIndex < MAX_EVENTS)
-        record = ObjectManagerEvents[CurrentEventIndex];
-    else
+    if (CurrentEventIndex > MAX_EVENTS)
         goto Exit;
 
-    record->StartTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStart();
 
     DbgPrint("--> %s", __FUNCTION__);
 
@@ -734,6 +752,20 @@ ObjectManagerPreCallback(
                 OperationInformation->Object,
                 ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
                 CreateParams->OriginalDesiredAccess);
+
+            //
+            // ETW Event
+            //
+            EventWriteObjectOp(
+                (ULONG64)PsGetCurrentProcessId(),
+                (ULONG64)PsGetCurrentThreadId(),
+                (ULONG64)OperationInformation->KernelHandle,
+                (ULONG64)OperationInformation->Object,
+                ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
+                (ULONG64)CreateParams->OriginalDesiredAccess,
+                (BOOLEAN)OperationInformation->Operation
+            );
+
             break;
         }
         case OB_OPERATION_HANDLE_DUPLICATE: 
@@ -748,6 +780,22 @@ ObjectManagerPreCallback(
                 DuplicateHandleParams->OriginalDesiredAccess,
                 DuplicateHandleParams->SourceProcess,
                 DuplicateHandleParams->TargetProcess);
+
+
+            // TODO(Kostya) consider adding duplicate event            
+            //
+            // ETW Event
+            //
+            EventWriteObjectOp(
+                (ULONG64)PsGetCurrentProcessId(),
+                (ULONG64)PsGetCurrentThreadId(),
+                (ULONG64)OperationInformation->KernelHandle,
+                (ULONG64)OperationInformation->Object,
+                ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
+                (ULONG64)DuplicateHandleParams->OriginalDesiredAccess,
+                (BOOLEAN)OperationInformation->Operation
+            );
+
             break;
         }
   
@@ -761,7 +809,7 @@ ObjectManagerPreCallback(
 
     DbgPrint("<-- %s", __FUNCTION__);
 
-    record->EndTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStop(ObjectManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 
 Exit:
    
@@ -951,15 +999,12 @@ CmRegistryCallback(
         goto Exit;
     }
 
-    PRegistryManagerEvent record;
     LONG CurrentEventIndex = InterlockedIncrement(&RegistryManagerEventIndex);
 
-    if (CurrentEventIndex < MAX_EVENTS)
-        record = RegistryManagerEvents[CurrentEventIndex];
-    else
+    if (CurrentEventIndex > MAX_EVENTS)
         goto Exit;
 
-    record->StartTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStart();
 
     DbgPrint("--> %s\n", __FUNCTION__);
 
@@ -976,9 +1021,19 @@ CmRegistryCallback(
     DbgPrint("CmRegistryCallback: Called for %ls (0x%x)\n",
         RegNotifyClassToString(RegistryNotifyClass), RegistryNotifyClass);
 
+    //
+    // ETW event
+    //
+    EventWriteRegOp(
+        (ULONG64)PsGetCurrentProcessId(),
+        (ULONG64)PsGetCurrentThreadId(),
+        RegNotifyClassToString(RegistryNotifyClass),
+        (ULONG64)RegistryNotifyClass
+    );
+
     DbgPrint("<-- %s\n", __FUNCTION__);
 
-    record->EndTime = KeQueryPerformanceCounter(NULL);
+    TimeOpStop(RegistryManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 
 Exit:
     return STATUS_SUCCESS;
@@ -1033,7 +1088,10 @@ VOID UnregisterAllCallbacks()
 //
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
-    NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS                   Status = STATUS_SUCCESS;
+    UNICODE_STRING             DeviceUnicodeString;    
+    UNICODE_STRING             Win32NameString;    
+    PDEVICE_OBJECT             DeviceObject = NULL;
     OB_CALLBACK_REGISTRATION   ObjectManagerCallbackRegistration;
     POB_OPERATION_REGISTRATION ObjectManagerOperationRegistration = NULL;
     ULONG                      ObjectManagerCallbackTypesSize;
@@ -1047,10 +1105,57 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     DbgPrint("Forensics Collector Driver Entry\n");
 
+    RtlInitUnicodeString(&DeviceUnicodeString, NT_DEVICE_NAME);
+
+    Status = IoCreateDevice(
+        DriverObject,                   // Our Driver Object
+        0,                              // We don't use a device extension
+        &DeviceUnicodeString,               // Device name "\Device\SIOCTL"
+        FILE_DEVICE_UNKNOWN,            // Device type
+        FILE_DEVICE_SECURE_OPEN,        // Device characteristics
+        FALSE,                          // Not an exclusive device
+        &DeviceObject);                 // Returned ptr to Device Object
+
+    if (!NT_SUCCESS(Status))
+    {
+        //
+        // We can still exit at this point without issues
+        //
+        DbgPrint(("Couldn't create the device object\n"));
+        return Status;
+    }
+
+    //
+    // Initialize the driver object with this driver's entry points.
+    //
+
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = CreateCloseDispatch;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]  = CreateCloseDispatch;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceControlDispatch;
+
+    Status = IoCreateSymbolicLink(
+        &Win32NameString, 
+        &DeviceUnicodeString
+    );
+
+    if (!NT_SUCCESS(Status))
+    {
+        //
+        // Delete everything that this routine has allocated.
+        //
+        DbgPrint("Couldn't create symbolic link\n");
+        IoDeleteDevice(DeviceObject);
+    }
+
     //
     // Initialize statistics  
     // 
     InitializeStatistics();
+
+    //
+    // Register ETW events
+    //
+    EventRegisterForensics_Collector_Provider();
 
     //
     // Register process creation/exit callback
@@ -1183,7 +1288,7 @@ Exit:
 
     if (!NT_SUCCESS(Status))
     {
-        UnregisterAllCallbacks();
+        DriverUnloadFunction(DriverObject);
 
         if (ObjectManagerOperationRegistration)
         {
@@ -1203,6 +1308,229 @@ VOID DriverUnloadFunction(PDRIVER_OBJECT DriverObject)
     UNREFERENCED_PARAMETER(DriverObject);
 
     UnregisterAllCallbacks();
+
+    ReleaseStatistics();
+
+    EventUnregisterForensics_Collector_Provider();
+}
+
+NTSTATUS
+CreateCloseDispatch(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+DeviceControlDispatch(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+{
+    PIO_STACK_LOCATION  IrpSp;// Pointer to current stack location
+    NTSTATUS            Status = STATUS_SUCCESS;// Assume success
+    
+    ULONG               InputBufferLength;
+    ULONG               OutputBufferLength;
+        
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    IrpSp = IoGetCurrentIrpStackLocation(Irp);
+    InputBufferLength = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+    OutputBufferLength = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+
+    switch (IrpSp->Parameters.DeviceIoControl.IoControlCode)
+    {
+    case GET_FLTMGR_EVENT:
+    {
+        if (InputBufferLength != sizeof(ULONG64)
+            ||
+            OutputBufferLength != sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        ULONG64 InputBuffer, OutputBuffer;
+        InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+        OutputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        (ULONG64)OutputBuffer = FilterManagerEvents[(LONG)InputBuffer].ElapsedMicroseconds.QuadPart;
+
+        Irp->IoStatus.Information = OutputBufferLength;
+
+    } break;
+
+    case GET_CREATE_EVENT:
+    {
+        if (InputBufferLength != sizeof(ULONG64)
+            ||
+            OutputBufferLength != sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        ULONG64 InputBuffer, OutputBuffer;
+        InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+        OutputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        (ULONG64)OutputBuffer = CreationEvents[(LONG)InputBuffer].ElapsedMicroseconds.QuadPart;
+
+        Irp->IoStatus.Information = OutputBufferLength;
+
+    } break;
+
+    case GET_LOAD_EVENT:
+    {
+        if (InputBufferLength != sizeof(ULONG64)
+            ||
+            OutputBufferLength != sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        ULONG64 InputBuffer, OutputBuffer;
+        InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+        OutputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        (ULONG64)OutputBuffer = LoadImageEvents[(LONG)InputBuffer].ElapsedMicroseconds.QuadPart;
+
+        Irp->IoStatus.Information = OutputBufferLength;
+
+    }   break;
+
+    case GET_OBJECT_EVENT:
+    {
+        if (InputBufferLength != sizeof(ULONG64)
+            ||
+            OutputBufferLength != sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        ULONG64 InputBuffer, OutputBuffer;
+        InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+        OutputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        (ULONG64)OutputBuffer = ObjectManagerEvents[(LONG)InputBuffer].ElapsedMicroseconds.QuadPart;
+
+        Irp->IoStatus.Information = OutputBufferLength;
+
+    }   break;
+
+    case GET_REGISTRY_EVENT:
+    {
+        if (InputBufferLength != sizeof(ULONG64)
+            ||
+            OutputBufferLength != sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        ULONG64 InputBuffer, OutputBuffer;
+        InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+        OutputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        (ULONG64)OutputBuffer = RegistryManagerEvents[(LONG)InputBuffer].ElapsedMicroseconds.QuadPart;
+
+        Irp->IoStatus.Information = OutputBufferLength;
+
+    }   break;
+
+    case GET_ALL_MISSES:
+    {
+        if (OutputBufferLength != 5 * sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        PULONG64 OutputBuffer;
+        OutputBuffer = (PULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        (PULONG64)OutputBuffer = (PULONG64)FilterManagerMisses;
+
+        OutputBuffer = Add2Ptr(OutputBuffer, sizeof(ULONG64));
+        (PULONG64)OutputBuffer = (PULONG64)CreationEventMisses;
+
+        OutputBuffer = Add2Ptr(OutputBuffer, sizeof(ULONG64));
+        (PULONG64)OutputBuffer = (PULONG64)LoadEventMisses;
+
+        OutputBuffer = Add2Ptr(OutputBuffer, sizeof(ULONG64));
+        (PULONG64)OutputBuffer = (PULONG64)ObjectManagerMisses;
+
+        OutputBuffer = Add2Ptr(OutputBuffer, sizeof(ULONG64));
+        (PULONG64)OutputBuffer = (PULONG64)RegistryManagerMisses;
+
+        Irp->IoStatus.Information = OutputBufferLength;
+
+    }   break;
+
+    case SET_SIM_PS_ID:
+    {
+        if (InputBufferLength != sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        ULONG64 InputBuffer;
+        InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        SimulationProcessId = (HANDLE)InputBuffer;
+
+        Irp->IoStatus.Information = 0;
+    } break;
+
+    case CLS_SIM_DATA:
+    {
+        if (FilterManagerEventIndex < MAX_EVENTS
+            ||
+            CreationEventIndex < MAX_EVENTS
+            ||
+            ObjectManagerEventIndex < MAX_EVENTS
+            ||
+            LoadEventMisses < MAX_EVENTS
+            ||
+            RegistryManagerEventIndex < MAX_EVENTS)
+        {
+            Status = STATUS_INFO_LENGTH_MISMATCH;
+            goto End;
+        }
+
+        SimulationProcessId = 0;
+
+        FilterManagerEventIndex = 0;
+        CreationEventIndex = 0;
+        ObjectManagerEventIndex = 0;
+        LoadEventMisses = 0;
+        RegistryManagerEventIndex = 0;
+
+        CleanStatisticalData();
+
+        Irp->IoStatus.Information = 0;
+    } break;
+    }
+
+End:
+    Irp->IoStatus.Status = Status;
+
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return Status;
 }
 
 #pragma endregion
