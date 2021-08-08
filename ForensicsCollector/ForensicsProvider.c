@@ -312,6 +312,119 @@ ULONG64 GetBaseAddress(char* ModuleName)
 
 #pragma endregion
 
+#pragma region Buffered Forensics 
+
+#define USE_BUFFERED_EVENTS 1
+
+//
+// Important definitions
+// Since this one file do it all, we will not keep this in a struct
+//
+
+#define FC_PORT_NAME                   L"\\ForensicsCollectorPort"
+
+KSPIN_LOCK BufferedEventsLock;
+LIST_ENTRY BufferedEventsList;
+
+#define MAX_NAME_SIZE 256
+
+//
+// We need 5 * 5000, I assume we will not have issues with out of memory
+//
+NPAGED_LOOKASIDE_LIST BufferedEventsAllocationList;
+
+#define FC_BUFFERED_EVENT_TAG 'ebCF'
+
+//
+// Buffered Forensics collection mechanism
+//
+
+#define FILTERMGR_EVENT_TYPE 0x10000000
+#define CREATEPS_EVENT_TYPE  0x20000000
+#define LOADIMAGE_EVENT_TYPE 0x40000000
+#define OBJECTMGR_EVENT_TYPE 0x80000000
+#define REG_MNGR_EVENT_TYPE  0x01000000
+
+// Extra flags
+#define CREATEPS_CREATE_BOOL    0x20000001
+#define OBJECTMGR_KERNEL_HANDLE 0x80000001
+#define OBJECTMGR_CREATE_HANDLE 0x80000002
+
+typedef struct _EVENT_DATA {
+
+    //
+    // Depending on the operation, we might need 
+    // additional infrmaion in terms of boolean
+    //
+
+    ULONG64 TypeAndFlags;
+    
+    ULONG64 ProcessId;
+    ULONG64 ThreadId;
+    
+    //
+    // Create Process Specific params
+    // EPROCESS/Parent PID
+    //
+    // Object Manager specific params
+    // Desired access, handle
+    //
+    // Registry manager specific param
+    // NotifyClass
+    ULONG64 ExParam1;
+    ULONG64 ExParam2;
+
+    //
+    // Take one of the possible strings
+    // FileName, Command Line, Image File Name, Operation Type, Notirfy Class Name
+    //
+    // We will play with the limit to see if it helps the speed
+    WCHAR Name1[MAX_NAME_SIZE];
+    WCHAR Name2[MAX_NAME_SIZE];
+
+} EVENT_DATA, * PEVENT_DATA;
+
+typedef struct _EVENTS_LIST {
+
+    LIST_ENTRY List;
+
+    EVENT_DATA Event;
+
+} EVENTS_LIST, * PEVENTS_LIST;
+
+PEVENTS_LIST
+AllocateBufferedEvent()
+{
+    PEVENTS_LIST EventList = ExAllocateFromNPagedLookasideList(&BufferedEventsAllocationList);
+
+    if (EventList == NULL)
+    {
+        // Unexpected, don't run verifier with low memory simulation
+        DbgPrint("%s Failed to allocate memory\n", __FUNCTION__);
+        ASSERT(0);
+    }
+    else
+    {
+        RtlZeroMemory(&EventList->Event, sizeof(EVENT_DATA));
+    }
+
+    return EventList;
+}
+
+VOID
+RetainEventList(
+    _In_ PEVENTS_LIST EventList
+)
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&BufferedEventsLock, &oldIrql);
+    InsertTailList(&BufferedEventsList, &EventList->List);
+    KeReleaseSpinLock(&BufferedEventsLock, oldIrql);
+}
+
+#pragma endregion
+
 #pragma region Filter Manager Callbacks
 
 #define LOG_SIZE 1024
@@ -321,6 +434,8 @@ typedef struct _FilterManagerContext
 {
     PDRIVER_OBJECT DriverObject;
     PFLT_FILTER Filter;
+    PFLT_PORT ServerPort;
+    PFLT_PORT ClientPort;
 } FilterManagerContext, * PFilterManagerContext;
 
 FilterManagerContext FPFilterManagerContext = { 0 };
@@ -382,10 +497,23 @@ PreOperationCallback(
         {
             DbgPrint("\tPid: 0x%p, FileName: %wZ\n", PsGetCurrentProcessId(), FileNameToLog->Buffer);
             
-            //
-            // ETW event saving
-            //
+#if USE_BUFFERED_EVENTS
+            PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+            if (EventList != NULL)
+            {
+                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                EventList->Event.ThreadId  = (ULONG64)PsGetCurrentThreadId();
+                EventList->Event.TypeAndFlags |= FILTERMGR_EVENT_TYPE;
+                RtlCopyMemory(EventList->Event.Name1, FileNameToLog->Buffer, min(MAX_NAME_SIZE, FileNameToLog->Length));
+
+                RetainEventList(EventList);
+            }
+#endif
+
+#if USE_ETW_EVENTS
             EventWriteFileOp((ULONG64)PsGetCurrentProcessId(), (ULONG64)PsGetCurrentThreadId(), FileNameToLog->Buffer);
+#endif
         }
 
         FltReleaseFileNameInformation(FileNameInfo);
@@ -478,6 +606,86 @@ CONST FLT_REGISTRATION FilterRegistration = {
     NULL                                    //  NormalizeNameComponent
 };
 
+NTSTATUS
+FCConnect(
+    _In_ PFLT_PORT ClientPort,
+    _In_ PVOID ServerPortCookie,
+    _In_reads_bytes_(SizeOfContext) PVOID ConnectionContext,
+    _In_ ULONG SizeOfContext,
+    _Flt_ConnectionCookie_Outptr_ PVOID* ConnectionCookie
+)
+{
+    UNREFERENCED_PARAMETER(ServerPortCookie);
+    UNREFERENCED_PARAMETER(ConnectionContext);
+    UNREFERENCED_PARAMETER(SizeOfContext);
+    UNREFERENCED_PARAMETER(ConnectionCookie);
+
+    FLT_ASSERT(FPFilterManagerContext.ClientPort == NULL);
+    FPFilterManagerContext.ClientPort = ClientPort;
+    return STATUS_SUCCESS;
+}
+
+VOID
+FCDisconnect(
+    _In_opt_ PVOID ConnectionCookie
+)
+{
+
+
+    UNREFERENCED_PARAMETER(ConnectionCookie);
+
+    FltCloseClientPort(FPFilterManagerContext.Filter, &FPFilterManagerContext.ClientPort);
+}
+
+//
+// The heart of Buffered event schema of transferring events to usermode
+// See: https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltcreatecommunicationport
+//
+NTSTATUS
+FCMessage(
+    _In_ PVOID ConnectionCookie,
+    _In_reads_bytes_opt_(InputBufferSize) PVOID InputBuffer,
+    _In_ ULONG InputBufferSize,
+    _Out_writes_bytes_to_opt_(OutputBufferSize, *ReturnOutputBufferLength) PVOID OutputBuffer,
+    _In_ ULONG OutputBufferSize,
+    _Out_ PULONG ReturnOutputBufferLength
+)
+
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(ConnectionCookie);
+    UNREFERENCED_PARAMETER(InputBuffer);
+    UNREFERENCED_PARAMETER(InputBufferSize);
+
+    for (;;)
+    {
+
+        if ((OutputBuffer == NULL) || (OutputBufferSize == 0)) {
+
+            Status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (!IS_ALIGNED(OutputBuffer, sizeof(PVOID))) {
+
+            Status = STATUS_DATATYPE_MISALIGNMENT;
+            break;
+        }
+
+        //
+        // Get the buffers to usermode
+        //
+
+        // TODO(Kostya) consider try/except, see above reference link
+        
+        ReturnOutputBufferLength = 0;
+        break;
+    }
+
+
+    return Status;
+}
+
 
 #pragma endregion
 
@@ -541,9 +749,7 @@ PsCreateProcessNotifyRoutineEx2Callback(
         {
             DbgPrint("\tPid: 0x%p, Command line: %wZ\n", ProcessId, CreateInfo->CommandLine);
 
-            //
-            // ETW Event
-            //
+#if USE_ETW_EVENTS
             EventWriteCreateOp(
                 (ULONG64)PsGetCurrentProcessId(),
                 (ULONG64)PsGetCurrentThreadId(),
@@ -553,6 +759,23 @@ PsCreateProcessNotifyRoutineEx2Callback(
                 (PCWSTR)CreateInfo->CommandLine->Buffer,
                 (PCWSTR)CreateInfo->ImageFileName->Buffer
             );
+#endif
+
+#if USE_BUFFERED_EVENTS
+            PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+            if (EventList != NULL)
+            {
+                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                EventList->Event.TypeAndFlags |= CREATEPS_CREATE_BOOL;
+                RtlCopyMemory(EventList->Event.Name1, CreateInfo->CommandLine->Buffer, min(MAX_NAME_SIZE, CreateInfo->CommandLine->Length));
+                RtlCopyMemory(EventList->Event.Name2, CreateInfo->ImageFileName->Buffer, min(MAX_NAME_SIZE, CreateInfo->ImageFileName->Length));
+
+                RetainEventList(EventList);
+            }
+#endif
+
         }
 
         DbgPrint("\tPid: 0x%p, Image Name: %wZ\n", ProcessId, CreateInfo->ImageFileName);
@@ -561,9 +784,20 @@ PsCreateProcessNotifyRoutineEx2Callback(
     {
         DbgPrint("\tProcess Exit: EPROCESS: 0x%p, Pid: 0x%p", Process, ProcessId);
 
-        //
-        // ETW Event
-        //
+#if USE_BUFFERED_EVENTS
+        PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+        if (EventList != NULL)
+        {
+            EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+            EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+            EventList->Event.TypeAndFlags |= CREATEPS_EVENT_TYPE;
+
+            RetainEventList(EventList);
+        }
+#endif
+
+#if USE_ETW_EVENTS
         EventWriteCreateOp(
             (ULONG64)PsGetCurrentProcessId(),
             (ULONG64)PsGetCurrentThreadId(),
@@ -573,6 +807,7 @@ PsCreateProcessNotifyRoutineEx2Callback(
             NULL,
             NULL
         );
+#endif
     }
 
     DbgPrint("<-- %s\n", __FUNCTION__);
@@ -621,14 +856,28 @@ LoadImageNotifyRoutineCallback(
     {
         DbgPrint("\t%wZ loaded in process 0x%p\n", FullImageName, ProcessId);
 
-        //
-        // ETW Event
-        //
+#if USE_ETW_EVENTS
         EventWriteLoadOp(
             (ULONG64)PsGetCurrentProcessId(),
             (ULONG64)PsGetCurrentThreadId(),
             (PCWSTR)FullImageName->Buffer
         );
+#endif
+
+#if USE_BUFFERED_EVENTS
+        PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+        if (EventList != NULL)
+        {
+            EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+            EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+            EventList->Event.TypeAndFlags |= LOADIMAGE_EVENT_TYPE;
+            RtlCopyMemory(EventList->Event.Name1, FullImageName->Buffer, min(MAX_NAME_SIZE, FullImageName->Length));
+
+            RetainEventList(EventList);
+        }
+#endif
+
     }
 
     DbgPrint("<-- %s\n", __FUNCTION__);
@@ -753,9 +1002,7 @@ ObjectManagerPreCallback(
                 ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
                 CreateParams->OriginalDesiredAccess);
 
-            //
-            // ETW Event
-            //
+#if USE_ETW_EVENTS
             EventWriteObjectOp(
                 (ULONG64)PsGetCurrentProcessId(),
                 (ULONG64)PsGetCurrentThreadId(),
@@ -765,6 +1012,25 @@ ObjectManagerPreCallback(
                 (ULONG64)CreateParams->OriginalDesiredAccess,
                 (BOOLEAN)OperationInformation->Operation
             );
+#endif
+
+#if USE_BUFFERED_EVENTS
+            PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+            if (EventList != NULL)
+            {
+                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                EventList->Event.TypeAndFlags |= OBJECTMGR_CREATE_HANDLE;
+                EventList->Event.TypeAndFlags |= OperationInformation->KernelHandle ? OBJECTMGR_KERNEL_HANDLE : 0;
+                EventList->Event.ExParam1 = (ULONG64)OperationInformation->Object;
+                EventList->Event.ExParam2 = (ULONG64)CreateParams->OriginalDesiredAccess;
+                PWCHAR ObjectTypeRequested = ObjectManagerObjectTypeToString(OperationInformation->ObjectType);
+                RtlCopyMemory(EventList->Event.Name1, ObjectTypeRequested, min(MAX_NAME_SIZE, wcslen(ObjectTypeRequested)));
+
+                RetainEventList(EventList);
+            }
+#endif
 
             break;
         }
@@ -783,9 +1049,7 @@ ObjectManagerPreCallback(
 
 
             // TODO(Kostya) consider adding duplicate event            
-            //
-            // ETW Event
-            //
+#if USE_ETW_EVENTS
             EventWriteObjectOp(
                 (ULONG64)PsGetCurrentProcessId(),
                 (ULONG64)PsGetCurrentThreadId(),
@@ -795,6 +1059,25 @@ ObjectManagerPreCallback(
                 (ULONG64)DuplicateHandleParams->OriginalDesiredAccess,
                 (BOOLEAN)OperationInformation->Operation
             );
+#endif
+
+#if USE_BUFFERED_EVENTS
+            PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+            if (EventList != NULL)
+            {
+                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                EventList->Event.TypeAndFlags |= OBJECTMGR_EVENT_TYPE;
+                EventList->Event.TypeAndFlags |= OperationInformation->KernelHandle ? OBJECTMGR_KERNEL_HANDLE : 0;
+                EventList->Event.ExParam1 = (ULONG64)OperationInformation->Object;
+                EventList->Event.ExParam2 = (ULONG64)DuplicateHandleParams->OriginalDesiredAccess;
+                PWCHAR ObjectTypeRequested = ObjectManagerObjectTypeToString(OperationInformation->ObjectType);
+                RtlCopyMemory(EventList->Event.Name1, ObjectTypeRequested, min(MAX_NAME_SIZE, wcslen(ObjectTypeRequested)));
+
+                RetainEventList(EventList);
+            }
+#endif
 
             break;
         }
@@ -1021,15 +1304,29 @@ CmRegistryCallback(
     DbgPrint("CmRegistryCallback: Called for %ls (0x%x)\n",
         RegNotifyClassToString(RegistryNotifyClass), RegistryNotifyClass);
 
-    //
-    // ETW event
-    //
+#if USE_ETW_EVENTS
     EventWriteRegOp(
         (ULONG64)PsGetCurrentProcessId(),
         (ULONG64)PsGetCurrentThreadId(),
         RegNotifyClassToString(RegistryNotifyClass),
         (ULONG64)RegistryNotifyClass
     );
+#endif
+
+#if USE_BUFFERED_EVENTS
+    PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+    if (EventList != NULL)
+    {
+        EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+        EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+        EventList->Event.TypeAndFlags |= REG_MNGR_EVENT_TYPE;
+        PWCHAR NotificationClass = RegNotifyClassToString(RegistryNotifyClass);
+        RtlCopyMemory(EventList->Event.Name1, NotificationClass, min(MAX_NAME_SIZE, wcslen(NotificationClass)));
+
+        RetainEventList(EventList);
+    }
+#endif
 
     DbgPrint("<-- %s\n", __FUNCTION__);
 
@@ -1156,6 +1453,85 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     // Register ETW events
     //
     EventRegisterForensics_Collector_Provider();
+
+
+    //
+    // Filter Manager registaration and buffered events logic initialize 
+    //
+
+    InitializeListHead(&BufferedEventsList);
+    KeInitializeSpinLock(&BufferedEventsLock);
+
+    ExInitializeNPagedLookasideList(&BufferedEventsAllocationList,
+        NULL,
+        NULL,
+        POOL_NX_ALLOCATION,
+        sizeof(EVENT_DATA),
+        FC_BUFFERED_EVENT_TAG,
+        0);
+
+    FPFilterManagerContext.DriverObject = DriverObject;
+
+    Status = FltRegisterFilter(
+        DriverObject,
+        &FilterRegistration,
+        &FPFilterManagerContext.Filter
+    );
+
+    if (!NT_SUCCESS(Status)) 
+    {
+        DbgPrint(("Couldn't \"attach\" to filter manager\n"));
+        goto Exit;
+    }
+
+    PSECURITY_DESCRIPTOR sd;
+    Status = FltBuildDefaultSecurityDescriptor(&sd,
+        FLT_PORT_ALL_ACCESS);
+
+    if (!NT_SUCCESS(Status)) 
+    {
+        DbgPrint(("Couldn't create port default security description\n"));
+        goto Exit;
+    }
+
+    UNICODE_STRING ForensicsCollectorPortName;
+    RtlInitUnicodeString(&ForensicsCollectorPortName, FC_PORT_NAME);
+    OBJECT_ATTRIBUTES oa;
+
+    InitializeObjectAttributes(&oa,
+        &ForensicsCollectorPortName,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+        NULL,
+        sd);
+
+    Status = FltCreateCommunicationPort(FPFilterManagerContext.Filter,
+        &FPFilterManagerContext.ServerPort,
+        &oa,
+        NULL,
+        FCConnect,
+        FCDisconnect,
+        FCMessage,
+        1);
+
+    FltFreeSecurityDescriptor(sd);
+
+    if (!NT_SUCCESS(Status)) 
+    {
+        DbgPrint(("Could not create Flt communication port\n"));
+        goto Exit;
+    }
+
+    //
+    //  We are now ready to start filtering
+    //
+
+    Status = FltStartFiltering(FPFilterManagerContext.Filter);
+
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(("Failed to start filtering the file system\n"));
+        goto Exit;
+    }
 
     //
     // Register process creation/exit callback
