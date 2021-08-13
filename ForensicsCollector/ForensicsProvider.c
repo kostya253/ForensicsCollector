@@ -34,10 +34,29 @@
 #include <wdm.h>
 #include <fltKernel.h>
 
+#pragma region Chosen Event Scheme
+
 //
-// ETW events
+// ETW Events schemes
 //
+ 
+#define USE_ETW_EVENTS 1
+#if USE_ETW_EVENTS
 #include "ForensicsCollector.h"
+#endif
+
+//
+// Buffered events scheme
+//
+#define USE_BUFFERED_EVENTS 1
+
+//
+// Compltion Events scheme
+//
+
+#define USE_COMPLETION_EVENTS 1
+
+#pragma endregion
 
 #pragma region Definitions
 //
@@ -79,6 +98,7 @@
 #define GET_ALL_MISSES     CTL_CODE( FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 #define SET_SIM_PS_ID      CTL_CODE( FILE_DEVICE_UNKNOWN, 0x907, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 #define CLS_SIM_DATA       CTL_CODE( FILE_DEVICE_UNKNOWN, 0x908, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define IS_SIM_DONE        CTL_CODE( FILE_DEVICE_UNKNOWN, 0x909, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 
 #pragma endregion
 
@@ -96,6 +116,12 @@ DRIVER_DISPATCH CreateCloseDispatch;
 
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH DeviceControlDispatch;
+
+_Dispatch_type_(IRP_MJ_READ)
+DRIVER_DISPATCH ReadDispatch;
+
+_Dispatch_type_(IRP_MJ_CLEANUP)
+DRIVER_DISPATCH CleanUpDispatch;
 
 #pragma endregion
 
@@ -314,8 +340,6 @@ ULONG64 GetBaseAddress(char* ModuleName)
 
 #pragma region Buffered Forensics 
 
-#define USE_BUFFERED_EVENTS 1
-
 //
 // Important definitions
 // Since this one file do it all, we will not keep this in a struct
@@ -425,6 +449,353 @@ RetainEventList(
 
 #pragma endregion
 
+#pragma region Event Driven Forensics
+
+PDEVICE_OBJECT g_pDeviceObject = NULL;
+
+//
+// Driver extension will be used by the event driven forensics collector
+//
+typedef struct _DEVICE_EXTENSION {
+
+    BOOLEAN EnableEvents;
+
+    KSPIN_LOCK Lock;
+    KIRQL OldIrql;
+
+    LIST_ENTRY PendingReadOp;
+
+    PIRP       PendingIrp;
+}  DEVICE_EXTENSION, * PDEVICE_EXTENSION;
+
+VOID LockDeviceExtension(PDEVICE_EXTENSION DeviceExtension)
+{
+    KeAcquireSpinLock(&DeviceExtension->Lock, &DeviceExtension->OldIrql);
+}
+
+VOID UnlockDeviceExtension(PDEVICE_EXTENSION DeviceExtension)
+{
+    KeReleaseSpinLock(&DeviceExtension->Lock, DeviceExtension->OldIrql);
+}
+
+PIRP PopPeningIRP(PDEVICE_EXTENSION DeviceExtension)
+{
+    PIRP PendingIRP = NULL;
+
+    if (DeviceExtension->PendingIrp) 
+    {
+        PendingIRP = DeviceExtension->PendingIrp;
+        DeviceExtension->PendingIrp = NULL;
+        IoSetCancelRoutine(PendingIRP, NULL);
+    }
+
+    return PendingIRP;
+}
+
+VOID ReleaseResources(PDEVICE_EXTENSION DeviceExtension)
+{
+    //
+    // We are shutting down, free all pending IRPs and signal on pending IRP
+    //
+
+    //
+    // We already relesed our resources
+    //
+    if (DeviceExtension->EnableEvents == FALSE)
+        return;
+
+    DeviceExtension->EnableEvents = FALSE;
+
+    PLIST_ENTRY List_Entry = NULL;
+
+    //
+    // Free all PendingIRPs 
+    //
+    while ((List_Entry = RemoveHeadList(&DeviceExtension->PendingReadOp)) != &DeviceExtension->PendingReadOp)
+    {
+        PEVENTS_LIST Event = CONTAINING_RECORD(List_Entry, EVENTS_LIST, List);
+        UNREFERENCED_PARAMETER(Event);
+    }
+
+    PIRP PendingIRP = PopPeningIRP(DeviceExtension);
+
+    //
+    // Make sure we don't deadlock, when completing the pending IRP
+    //
+    UnlockDeviceExtension(DeviceExtension);
+
+    if (PendingIRP)
+    {
+        PendingIRP->IoStatus.Information = 0;
+        PendingIRP->IoStatus.Status = STATUS_INVALID_HANDLE;
+        IoCompleteRequest(PendingIRP, IO_NO_INCREMENT);
+    }
+
+    LockDeviceExtension(DeviceExtension);
+}
+
+NTSTATUS
+CreateCloseDispatch(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+{
+    PIO_STACK_LOCATION  irpStack;
+    NTSTATUS            Status = STATUS_SUCCESS;
+    
+    PDEVICE_EXTENSION DeviceExtension = DeviceObject->DeviceExtension;
+
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+
+    switch (irpStack->MajorFunction)
+    {
+    case IRP_MJ_CREATE:
+    {
+        LockDeviceExtension(DeviceExtension);
+
+        //
+        // Allow only one Event Driven Forensics collector
+        //
+        if (DeviceExtension->EnableEvents == FALSE)
+        {
+            DeviceExtension->EnableEvents = TRUE;
+        }
+        else
+        {
+            //
+            // For simplicity we support one instance
+            //
+            Status = STATUS_SHARING_VIOLATION;
+        }
+
+        UnlockDeviceExtension(DeviceExtension);
+    } break;
+
+    case IRP_MJ_CLOSE:
+    {
+        LockDeviceExtension(DeviceExtension);
+        ReleaseResources(DeviceExtension);
+        UnlockDeviceExtension(DeviceExtension);
+    } break;
+
+    default:
+        Status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+
+    //
+    // Save Status for return and complete Irp
+    //
+    Irp->IoStatus.Status = Status;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return Status;
+}
+
+VOID
+CancelIRPRoutine(PDEVICE_OBJECT PDeviceObject, PIRP Irp)
+{
+    KIRQL cancelIrql = Irp->CancelIrql;
+    IoReleaseCancelSpinLock(cancelIrql);
+
+    PDEVICE_EXTENSION DeviceExtension = PDeviceObject->DeviceExtension;
+    
+    LockDeviceExtension(DeviceExtension);
+
+    //
+    // Essential check, we don't do something crazy
+    //
+    if (DeviceExtension->PendingIrp == Irp) 
+    {
+        DeviceExtension->PendingIrp = NULL;
+    }
+
+    UnlockDeviceExtension(DeviceExtension);
+
+    Irp->IoStatus.Information = 0;
+    Irp->IoStatus.Status = STATUS_CANCELLED;
+
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+}
+
+VOID
+CompleteReadOpIrp(PIRP Irp, PEVENTS_LIST Event)
+{
+    PEVENT_DATA UserModeReadEvent = (PEVENT_DATA)Irp->AssociatedIrp.SystemBuffer;
+    RtlCopyMemory(UserModeReadEvent, &Event->Event, sizeof(EVENT_DATA));
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = sizeof(EVENT_DATA);
+
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+}
+
+//
+// The essence of the Event Driven approach, allow multiple reads in different threads
+// to consume forensics events
+//
+NTSTATUS
+ReadDispatch(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+{
+    PIO_STACK_LOCATION  irpStack;
+    NTSTATUS            Status = STATUS_SUCCESS;
+    ULONG_PTR           ReadBytes = 0;
+
+    PDEVICE_EXTENSION DeviceExtension = DeviceObject->DeviceExtension;
+
+    irpStack = IoGetCurrentIrpStackLocation(Irp);
+
+    if (irpStack)
+    {
+        PVOID PReadBuffer = Irp->AssociatedIrp.SystemBuffer;
+        ULONG BufferSize  = irpStack->Parameters.Read.Length;
+
+        //
+        // Lets check usermode has enough space and buffer valid
+        //
+        if (PReadBuffer != NULL
+            &&
+            BufferSize == sizeof(EVENT_DATA))
+        {
+            PEVENTS_LIST Event = NULL;
+
+            LockDeviceExtension(DeviceExtension);
+
+            //
+            // Copy buffers, if we started collecting them
+            // 
+            if (DeviceExtension->EnableEvents)
+            {
+                PLIST_ENTRY List_Entry = RemoveHeadList(&DeviceExtension->PendingReadOp);
+
+                if (List_Entry != &DeviceExtension->PendingReadOp)
+                {
+                    Event = CONTAINING_RECORD(List_Entry, EVENTS_LIST, List);
+                }
+                else
+                {
+                    //
+                    // The list is empty, pend the read operation
+                    //
+
+                    if (DeviceExtension->PendingIrp == NULL)
+                    {
+                        IoSetCancelRoutine(Irp, CancelIRPRoutine);
+                        IoMarkIrpPending(Irp);
+
+                        DeviceExtension->PendingIrp = Irp;
+                        Status = STATUS_PENDING;
+                    }
+                    else
+                    {
+                        //
+                        // We already have pending IRP, fail current request
+                        //
+                        Status = STATUS_REQUEST_OUT_OF_SEQUENCE;
+                    }
+                }
+            }
+            else
+            {
+                //
+                // Might be a race where, read serviced before create done
+                //
+                Status = STATUS_DEVICE_NOT_CONNECTED;
+            }
+
+            UnlockDeviceExtension(DeviceExtension);
+
+            if (Event)
+            {
+                //
+                // We have data to send to usermode
+                //
+                PEVENT_DATA UserModeReadEvent = (PEVENT_DATA)Irp->AssociatedIrp.SystemBuffer;
+                RtlCopyMemory(UserModeReadEvent, &Event->Event, sizeof(EVENT_DATA));
+                ReadBytes = sizeof(EVENT_DATA);
+            }
+        }
+        else
+        {
+            Status = STATUS_INVALID_PARAMETER;
+        }
+    }
+
+    if (Status != STATUS_PENDING)
+    {
+        Irp->IoStatus.Status = Status;
+        Irp->IoStatus.Information = ReadBytes;
+
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    }
+
+    return Status;
+}
+
+NTSTATUS
+CleanupDispatch(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp
+)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return STATUS_SUCCESS;
+}
+
+//
+// Save or send event immidiately to user mode
+//
+VOID
+PendEvent(_In_ PEVENTS_LIST EventList)
+{
+    PDEVICE_EXTENSION DeviceExtension = g_pDeviceObject->DeviceExtension;
+
+    LockDeviceExtension(DeviceExtension);
+    PIRP PendingIrp = NULL;
+    if (DeviceExtension->EnableEvents)
+    {
+        //
+        // Check if we have pending IRP to complete now
+        //
+
+        PendingIrp = DeviceExtension->PendingIrp;
+        if (DeviceExtension->PendingIrp == NULL)
+        {
+            //
+            // Save event until next read operation
+            //
+            InsertTailList(&DeviceExtension->PendingReadOp, &EventList->List);
+        }
+        else
+        {
+            //
+            // Take ownership of the pending IRP and complete it here (in this function)
+            //
+            DeviceExtension->PendingIrp = NULL;
+        }
+    }
+
+    UnlockDeviceExtension(DeviceExtension);
+
+    if (PendingIrp)
+    {
+        CompleteReadOpIrp(PendingIrp, EventList);
+    }
+}
+
+
+#pragma endregion
+
 #pragma region Filter Manager Callbacks
 
 #define LOG_SIZE 1024
@@ -497,7 +868,7 @@ PreOperationCallback(
         {
             DbgPrint("\tPid: 0x%p, FileName: %wZ\n", PsGetCurrentProcessId(), FileNameToLog->Buffer);
             
-#if USE_BUFFERED_EVENTS
+#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
             PEVENTS_LIST EventList = AllocateBufferedEvent();
 
             if (EventList != NULL)
@@ -507,7 +878,14 @@ PreOperationCallback(
                 EventList->Event.TypeAndFlags |= FILTERMGR_EVENT_TYPE;
                 RtlCopyMemory(EventList->Event.Name1, FileNameToLog->Buffer, min(MAX_NAME_SIZE, FileNameToLog->Length));
 
+#if USE_BUFFERED_EVENTS
                 RetainEventList(EventList);
+#endif
+
+#if USE_COMPLETION_EVENTS
+                PendEvent(EventList);
+#endif
+
             }
 #endif
 
@@ -630,8 +1008,6 @@ FCDisconnect(
     _In_opt_ PVOID ConnectionCookie
 )
 {
-
-
     UNREFERENCED_PARAMETER(ConnectionCookie);
 
     FltCloseClientPort(FPFilterManagerContext.Filter, &FPFilterManagerContext.ClientPort);
@@ -761,7 +1137,7 @@ PsCreateProcessNotifyRoutineEx2Callback(
             );
 #endif
 
-#if USE_BUFFERED_EVENTS
+#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
             PEVENTS_LIST EventList = AllocateBufferedEvent();
 
             if (EventList != NULL)
@@ -772,7 +1148,14 @@ PsCreateProcessNotifyRoutineEx2Callback(
                 RtlCopyMemory(EventList->Event.Name1, CreateInfo->CommandLine->Buffer, min(MAX_NAME_SIZE, CreateInfo->CommandLine->Length));
                 RtlCopyMemory(EventList->Event.Name2, CreateInfo->ImageFileName->Buffer, min(MAX_NAME_SIZE, CreateInfo->ImageFileName->Length));
 
+#if USE_BUFFERED_EVENTS
                 RetainEventList(EventList);
+#endif
+
+#if USE_COMPLETION_EVENTS
+                PendEvent(EventList);
+#endif
+
             }
 #endif
 
@@ -784,7 +1167,7 @@ PsCreateProcessNotifyRoutineEx2Callback(
     {
         DbgPrint("\tProcess Exit: EPROCESS: 0x%p, Pid: 0x%p", Process, ProcessId);
 
-#if USE_BUFFERED_EVENTS
+#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
         PEVENTS_LIST EventList = AllocateBufferedEvent();
 
         if (EventList != NULL)
@@ -793,7 +1176,14 @@ PsCreateProcessNotifyRoutineEx2Callback(
             EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
             EventList->Event.TypeAndFlags |= CREATEPS_EVENT_TYPE;
 
+#if USE_BUFFERED_EVENTS
             RetainEventList(EventList);
+#endif
+
+#if USE_COMPLETION_EVENTS
+            PendEvent(EventList);
+#endif
+
         }
 #endif
 
@@ -864,7 +1254,7 @@ LoadImageNotifyRoutineCallback(
         );
 #endif
 
-#if USE_BUFFERED_EVENTS
+#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
         PEVENTS_LIST EventList = AllocateBufferedEvent();
 
         if (EventList != NULL)
@@ -874,7 +1264,14 @@ LoadImageNotifyRoutineCallback(
             EventList->Event.TypeAndFlags |= LOADIMAGE_EVENT_TYPE;
             RtlCopyMemory(EventList->Event.Name1, FullImageName->Buffer, min(MAX_NAME_SIZE, FullImageName->Length));
 
+#if USE_BUFFERED_EVENTS
             RetainEventList(EventList);
+#endif
+
+#if USE_COMPLETION_EVENTS
+            PendEvent(EventList);
+#endif
+
         }
 #endif
 
@@ -1014,7 +1411,7 @@ ObjectManagerPreCallback(
             );
 #endif
 
-#if USE_BUFFERED_EVENTS
+#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
             PEVENTS_LIST EventList = AllocateBufferedEvent();
 
             if (EventList != NULL)
@@ -1028,7 +1425,14 @@ ObjectManagerPreCallback(
                 PWCHAR ObjectTypeRequested = ObjectManagerObjectTypeToString(OperationInformation->ObjectType);
                 RtlCopyMemory(EventList->Event.Name1, ObjectTypeRequested, min(MAX_NAME_SIZE, wcslen(ObjectTypeRequested)));
 
+#if USE_BUFFERED_EVENTS
                 RetainEventList(EventList);
+#endif
+
+#if USE_COMPLETION_EVENTS
+                PendEvent(EventList);
+#endif
+
             }
 #endif
 
@@ -1061,7 +1465,7 @@ ObjectManagerPreCallback(
             );
 #endif
 
-#if USE_BUFFERED_EVENTS
+#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
             PEVENTS_LIST EventList = AllocateBufferedEvent();
 
             if (EventList != NULL)
@@ -1075,7 +1479,14 @@ ObjectManagerPreCallback(
                 PWCHAR ObjectTypeRequested = ObjectManagerObjectTypeToString(OperationInformation->ObjectType);
                 RtlCopyMemory(EventList->Event.Name1, ObjectTypeRequested, min(MAX_NAME_SIZE, wcslen(ObjectTypeRequested)));
 
+#if USE_BUFFERED_EVENTS
                 RetainEventList(EventList);
+#endif
+
+#if USE_COMPLETION_EVENTS
+                PendEvent(EventList);
+#endif
+
             }
 #endif
 
@@ -1313,7 +1724,7 @@ CmRegistryCallback(
     );
 #endif
 
-#if USE_BUFFERED_EVENTS
+#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
     PEVENTS_LIST EventList = AllocateBufferedEvent();
 
     if (EventList != NULL)
@@ -1324,7 +1735,14 @@ CmRegistryCallback(
         PWCHAR NotificationClass = RegNotifyClassToString(RegistryNotifyClass);
         RtlCopyMemory(EventList->Event.Name1, NotificationClass, min(MAX_NAME_SIZE, wcslen(NotificationClass)));
 
+#if USE_BUFFERED_EVENTS
         RetainEventList(EventList);
+#endif
+
+#if USE_COMPLETION_EVENTS
+        PendEvent(EventList);
+#endif
+
     }
 #endif
 
@@ -1392,6 +1810,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     OB_CALLBACK_REGISTRATION   ObjectManagerCallbackRegistration;
     POB_OPERATION_REGISTRATION ObjectManagerOperationRegistration = NULL;
     ULONG                      ObjectManagerCallbackTypesSize;
+    PDEVICE_EXTENSION          DeviceExtension;
 
     UNICODE_STRING CmAltitude; // Registry callback altitude
 
@@ -1406,8 +1825,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     Status = IoCreateDevice(
         DriverObject,                   // Our Driver Object
-        0,                              // We don't use a device extension
-        &DeviceUnicodeString,               // Device name "\Device\SIOCTL"
+        sizeof(DEVICE_EXTENSION),       // We use this for Event Driven Forensics
+        &DeviceUnicodeString,           // Device name "\Device\SIOCTL"
         FILE_DEVICE_UNKNOWN,            // Device type
         FILE_DEVICE_SECURE_OPEN,        // Device characteristics
         FALSE,                          // Not an exclusive device
@@ -1422,6 +1841,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return Status;
     }
 
+    DeviceExtension = DeviceObject->DeviceExtension;
+
     //
     // Initialize the driver object with this driver's entry points.
     //
@@ -1429,6 +1850,27 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_CREATE] = CreateCloseDispatch;
     DriverObject->MajorFunction[IRP_MJ_CLOSE]  = CreateCloseDispatch;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceControlDispatch;
+
+    //
+    // Dedicated for event driven events
+    //
+    DriverObject->MajorFunction[IRP_MJ_READ] = ReadDispatch;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP] = CleanupDispatch;
+
+    // TODO(kostya) Should we handle IRP_MJ_SHUTDOWN for our tests or we assume the system
+    // never shuts down
+
+    //
+    // Copy buffers, before sending to usermode
+    //
+    DeviceObject->Flags |= DO_BUFFERED_IO;
+
+    //
+    // Event Driven initialization of internal structrures
+    //
+    KeInitializeSpinLock(&DeviceExtension->Lock);
+
+    InitializeListHead(&DeviceExtension->PendingReadOp);
 
     Status = IoCreateSymbolicLink(
         &Win32NameString, 
@@ -1452,7 +1894,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     //
     // Register ETW events
     //
+#if USE_ETW_EVENTS
     EventRegisterForensics_Collector_Provider();
+#endif
 
 
     //
@@ -1671,6 +2115,13 @@ Exit:
             ExFreePoolWithTag(ObjectManagerOperationRegistration, 'NKob');
         }
     }
+    else
+    {
+        //
+        // Save for Event driven forensics
+        //
+        g_pDeviceObject = DeviceObject;
+    }
 
     return Status;
 }
@@ -1687,23 +2138,9 @@ VOID DriverUnloadFunction(PDRIVER_OBJECT DriverObject)
 
     ReleaseStatistics();
 
+#if USE_ETW_EVENTS
     EventUnregisterForensics_Collector_Provider();
-}
-
-NTSTATUS
-CreateCloseDispatch(
-    PDEVICE_OBJECT DeviceObject,
-    PIRP Irp
-)
-{
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    Irp->IoStatus.Status = STATUS_SUCCESS;
-    Irp->IoStatus.Information = 0;
-
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-
-    return STATUS_SUCCESS;
+#endif
 }
 
 NTSTATUS
@@ -1899,6 +2336,27 @@ DeviceControlDispatch(
 
         Irp->IoStatus.Information = 0;
     } break;
+
+    case IS_SIM_DONE:
+    {
+        if (FilterManagerEventIndex < MAX_EVENTS
+            ||
+            CreationEventIndex < MAX_EVENTS
+            ||
+            ObjectManagerEventIndex < MAX_EVENTS
+            ||
+            LoadEventMisses < MAX_EVENTS
+            ||
+            RegistryManagerEventIndex < MAX_EVENTS)
+        {
+            Status = STATUS_INFO_LENGTH_MISMATCH;
+            goto End;
+        }
+
+        Irp->IoStatus.Information = 0;
+
+    } break;
+
     }
 
 End:
