@@ -16,6 +16,7 @@
 [DestinationDirs]
     DefaultDestDir      = 12                              ; %WinDir%\System32\Drivers
     ForensicsCollector.DriverFiles = 12                   ; %WinDir%\System32\Drivers
+    ForensicsCollector.UserFiles   = 10,FltMgr            ;%windir%\FltMgr
 
 [SourceDisksNames]
     1 = %DiskName%,,,""
@@ -46,6 +47,13 @@
     StartType     = 3                                     ; SERVICE_DEMAND_START
     ErrorControl  = 1                                     ; SERVICE_ERROR_NORMAL
     ServiceBinary = %12%\ForensicsCollector.sys           ; %WinDir%\System32\Drivers\ForensicsCollector.sys
+    AddReg           = ForensicsCollector.AddRegistry
+
+[ForensicsCollector.AddRegistry]
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%Instance.Name%,"Altitude",0x00000000,%Instance.Altitude%
+HKR,"Instances\"%Instance.Name%,"Flags",0x00010001,%Instance.Flags%
 
 [Strings]
     ManufacturerName="ForensicsCollector"
@@ -53,3 +61,7 @@
     DiskName="ForensicsCollector Source Disk"
     ForensicsCollectorServiceDesc = "Forensics Collector Driver"
     ForensicsCollectorServiceName = "ForensicsCollector"
+    DefaultInstance         = "ForensicsCollector Instance"
+    Instance.Name          = "ForensicsCollector Instance"
+    Instance.Altitude      = "84666"
+    Instance.Flags         = 0x0          ; Force automatic attachments!
