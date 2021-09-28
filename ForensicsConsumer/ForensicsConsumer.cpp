@@ -1194,7 +1194,7 @@ int GenerateETWEvents()
 
         printf("Flushing events\n");
 
-        ss << "evt." << i;
+        ss << "etw." << i;
 
         if (GetCSVFile(ss.str().c_str()) != 0)
         {
@@ -1311,8 +1311,15 @@ int GenerateBufEvents()
     return 0;
 }
 
+//
+// Use with performance analyzer:
+// CollectWPR.cmd "ForensicsConsumer.exe SIM_EVT"
+//
 int GenerateEvtEvents(int run_index)
 {
+    printf("Sleeping for 5 seconds\n");
+    Sleep(5000);
+
     //
     // Can fail if ran for the first time
     //

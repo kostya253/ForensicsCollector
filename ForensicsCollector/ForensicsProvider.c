@@ -48,13 +48,13 @@
 //
 // Buffered events scheme
 //
-#define USE_BUFFERED_EVENTS 0
+#define USE_BUFFERED_EVENTS 1
 
 //
-// Compltion Events scheme
+// Completion Events scheme
 //
 
-#define USE_COMPLETION_EVENTS 1
+#define USE_COMPLETION_EVENTS 0
 
 #pragma endregion
 
@@ -141,16 +141,28 @@ HANDLE SimulationProcessId = 0;
 //
 // See https://docs.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps
 //
+// Limited to < 1 microsecond
+// 
+//#define TimeOpStart() {                                             \
+//    LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
+//    LARGE_INTEGER Frequency;                                        \
+//    StartingTime = KeQueryPerformanceCounter(&Frequency);           \
+//
+//#define TimeOpStop(s)                                                \
+//    EndingTime = KeQueryPerformanceCounter(NULL);                   \
+//    ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
+//    ElapsedMicroseconds.QuadPart *= 1000000;                        \
+//    ElapsedMicroseconds.QuadPart /= Frequency.QuadPart;             \
+//    s = ElapsedMicroseconds.QuadPart;                               \
+//    }                                                               
+
 #define TimeOpStart() {                                             \
     LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
-    LARGE_INTEGER Frequency;                                        \
-    StartingTime = KeQueryPerformanceCounter(&Frequency);           \
+    StartingTime = KeQueryPerformanceCounter(NULL);                 \
 
 #define TimeOpStop(s)                                                \
     EndingTime = KeQueryPerformanceCounter(NULL);                   \
     ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
-    ElapsedMicroseconds.QuadPart *= 1000000;                        \
-    ElapsedMicroseconds.QuadPart /= Frequency.QuadPart;             \
     s = ElapsedMicroseconds.QuadPart;                               \
     }                                                               
 
