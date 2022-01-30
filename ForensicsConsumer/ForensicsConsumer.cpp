@@ -64,6 +64,11 @@
 #define CLS_SIM_DATA       CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x908, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 #define IS_SIM_DONE        CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x909, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 #define GET_ALL_INDEXES    CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x910, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define SET_SCHEME         CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x911, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+
+#define ETW_ON_FLAG 1
+#define FLT_ON_FLAG 2
+#define CMT_ON_FLAG 4
 
 //
 // C++ 11 Magic
@@ -104,7 +109,7 @@ int GetMisses()
         FILE_ATTRIBUTE_NORMAL,
         NULL));
 
-    if(!driver_handle) // op bool
+    if (!driver_handle) // op bool
     {
 
         DWORD le = GetLastError();
@@ -157,6 +162,40 @@ int SetPSId(ULONG64 pid)
     if (!DeviceIoControl(driver_handle.get(), SET_SIM_PS_ID, &pid, sizeof(ULONG64), NULL, 0, &dwBytesReturned, NULL))
     {
         printf("Failed to set simulation pid with error: %d\n", GetLastError());
+        return 2;
+    }
+
+    return 0;
+}
+
+//
+// Set forensics operation mode: ETW, FLTMgr, Compltion events
+//
+int SetScheme(ULONG64 mode)
+{
+    DWORD le = 0;
+
+    auto driver_handle = CreateAutoHandle(CreateFileW(DRIVER_NAME,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL));
+
+    if (!driver_handle) // op bool
+    {
+        DWORD le = GetLastError();
+
+        printf("Failed to open a handle to ForensicsCollector : %d\n", le);
+
+        return 1;
+    }
+
+    DWORD dwBytesReturned = 0;
+    if (!DeviceIoControl(driver_handle.get(), SET_SCHEME, &mode, sizeof(ULONG64), NULL, 0, &dwBytesReturned, NULL))
+    {
+        printf("Failed to set scheme mode with error: %d\n", GetLastError());
         return 2;
     }
 
@@ -329,8 +368,8 @@ int ParseCVSFile(const wchar_t* filename)
         ULONG index = 0;
         ULONG latency = 0;
 
-        printf("File %S open for parsing\n", filename);     
-        
+        printf("File %S open for parsing\n", filename);
+
         std::wstring line;
 
         //
@@ -341,9 +380,9 @@ int ParseCVSFile(const wchar_t* filename)
             const std::wregex base_regex(L"(\\w+),([0-9]+),([0-9]+)");
             std::wsmatch base_match;
 
-            if (std::regex_match(line, base_match, base_regex)) 
+            if (std::regex_match(line, base_match, base_regex))
             {
-                if (base_match.size() == 4) 
+                if (base_match.size() == 4)
                 {
                     std::wssub_match type_sub_match = base_match[1];
                     std::wstring type = type_sub_match.str();
@@ -367,7 +406,7 @@ int ParseCVSFile(const wchar_t* filename)
     return 0;
 }
 
-enum event_type {FLTMGR, PSCRT, LDIMG, OBMGR, REGMGR};
+enum event_type { FLTMGR, PSCRT, LDIMG, OBMGR, REGMGR };
 int FixMissingEvents(std::function<bool(event_type event, ULONG64)> fn)
 {
     DWORD le = 0;
@@ -395,43 +434,43 @@ int FixMissingEvents(std::function<bool(event_type event, ULONG64)> fn)
     ULONG64 MissesData[INDEX_ARRAY_SIZE] = { 0 };
     if (
         !DeviceIoControl(
-            driver_handle.get(), 
-            GET_ALL_INDEXES, 
-            NULL, 
-            0, 
-            &MissesData, 
-            sizeof(ULONG64) * INDEX_ARRAY_SIZE, 
-            &dwBytesReturned, 
+            driver_handle.get(),
+            GET_ALL_INDEXES,
+            NULL,
+            0,
+            &MissesData,
+            sizeof(ULONG64) * INDEX_ARRAY_SIZE,
+            &dwBytesReturned,
             NULL
         )
-    )
+        )
     {
         printf("Failed to get index data with error: %d\n", GetLastError());
         return 2;
     }
 
     printf("FilterManager  index: %I64u\n", MissesData[0]);
-    
+
     if (MissesData[0] < MAX_EVENTS)
         fn(FLTMGR, MAX_EVENTS - MissesData[0]);
-    
+
     printf("CreationEvent  index: %I64u\n", MissesData[1]);
-    
+
     if (MissesData[1] < MAX_EVENTS)
         fn(PSCRT, MAX_EVENTS - MissesData[1]);
-    
+
     printf("LoadEvent      index: %I64u\n", MissesData[2]);
-    
+
     if (MissesData[2] < MAX_EVENTS)
         fn(LDIMG, MAX_EVENTS - MissesData[2]);
-    
+
     printf("ObjectManager  index: %I64u\n", MissesData[3]);
-    
+
     if (MissesData[3] < MAX_EVENTS)
         fn(OBMGR, MAX_EVENTS - MissesData[3]);
-    
+
     printf("RegistryManage index: %I64u\n", MissesData[4]);
-    
+
     if (MissesData[4] < MAX_EVENTS)
         fn(OBMGR, MAX_EVENTS - MissesData[4]);
 
@@ -530,7 +569,7 @@ bool IsSimulationFinished()
 
 void PullBufferedEvents(HANDLE shutdown_event)
 {
-    std::thread t([&] 
+    std::thread t([&]
         {
             HRESULT result = S_OK;
             HANDLE port = INVALID_HANDLE_VALUE;
@@ -579,16 +618,16 @@ void PullBufferedEvents(HANDLE shutdown_event)
                     sizeof(EventBuffer),
                     &bytesReturned);
 
-                if (IS_ERROR(result)) 
+                if (IS_ERROR(result))
                 {
 
-                    if (HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) == result) 
+                    if (HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) == result)
                     {
 
                         printf("Forensics Collector unloaded\n");
                         break;
                     }
-                    else 
+                    else
                     {
                         Sleep(POLL_LATENCY);
                     }
@@ -615,9 +654,9 @@ void PullBufferedEvents(HANDLE shutdown_event)
                     {
                     case FILTERMGR_EVENT_TYPE:
                     {
-                        sprintf_s(db_buffer, DB_BUFFER_MAX_SIZE, 
-                            "FilterManager Event: [%I64u:%I64u] %S \n", 
-                            received_event->ProcessId, 
+                        sprintf_s(db_buffer, DB_BUFFER_MAX_SIZE,
+                            "FilterManager Event: [%I64u:%I64u] %S \n",
+                            received_event->ProcessId,
                             received_event->ThreadId,
                             received_event->Name1 ? received_event->Name1 : L" EMPTY "
                         );
@@ -1097,24 +1136,24 @@ int GenerateEvents()
 {
     srand(1);
 
-    for (int i = 0; i < MAX_EVENTS+1; ++i)
+    for (int i = 0; i < MAX_EVENTS + 1; ++i)
     {
         {
             FileEvent fe;
         }
-        
+
         {
             RegistryOperation ro;
         }
-        
+
         {
             CreationEvent ce;
         }
-        
+
         {
             LoadImageEvent le;
         }
-        
+
         {
             ObjectManagerEvent oe;
         }
@@ -1126,7 +1165,7 @@ int GenerateEvents()
 int GenerateETWEvents()
 {
     system("logman create trace \"FC\" -ow -o file.etl -p \"{A81A60B5-B6C0-47B0-A009-7E5414298DA5}\" 0xffffffff 0xff -ets");
-    
+
     for (int i = 0; i < 500; ++i)
     {
         std::stringstream ss;
@@ -1388,7 +1427,7 @@ int GenerateEvtEvents(int run_index)
 int wmain(int argc, wchar_t* argv[])
 {
     printf("Forensics Consumer ver 1.0\n");
-    
+
     if (argc < 2)
     {
         printf("Usage:\n");
@@ -1396,7 +1435,7 @@ int wmain(int argc, wchar_t* argv[])
         printf("SET_PS_ID: set simulation id\n");
         printf("GET_MISSES: get the misses stats\n");
         printf("GET_CSV: create csv with simulated data\n");
-        printf("GET_BUF: Fetch all buffered events\n");        
+        printf("GET_BUF: Fetch all buffered events\n");
         printf("GEN_EVT: generate events\n");
         printf("SIM_ETW: Generate evetns for ETW consumer\n");
         printf("SIM_BUF: Generate events for Buffered consumer\n");

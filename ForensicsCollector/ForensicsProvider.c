@@ -34,19 +34,19 @@
 #include <wdm.h>
 #include <fltKernel.h>
 
+#include "ForensicsCollector.h"
+
 #pragma region Chosen Event Scheme
 
-//
-// ETW Events schemes
-//
- 
-#define USE_ETW_EVENTS 0
-#if USE_ETW_EVENTS
-#include "ForensicsCollector.h"
-#endif
+#define ETW_ON_FLAG 1
+#define FLT_ON_FLAG 2
+#define CMT_ON_FLAG 4
+
+ULONG64 gEventScheme = 0;
+
 
 //
-// Buffered events scheme
+// Non-Buffered events scheme
 //
 #define USE_BUFFERED_EVENTS 1
 
@@ -65,9 +65,9 @@
 
 // Until we reach production level, either BSOD or break into the debugger
 #if 1
-    #define ASSERT_NT_SUCCESS(x) if(!NT_SUCCESS(x)) __debugbreak();
+#define ASSERT_NT_SUCCESS(x) if(!NT_SUCCESS(x)) __debugbreak();
 #else
-    #define ASSERT_NT_SUCCESS(x) if(!NT_SUCCESS(x)) DbgPrint("ASSERTED at %d with Status: 0x%x\n", __LINE__, x);
+#define ASSERT_NT_SUCCESS(x) if(!NT_SUCCESS(x)) DbgPrint("ASSERTED at %d with Status: 0x%x\n", __LINE__, x);
 #endif
 
 #define POOL_TAG 'tpPF'
@@ -102,6 +102,7 @@
 #define CLS_SIM_DATA       CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x908, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 #define IS_SIM_DONE        CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x909, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 #define GET_ALL_INDEXES    CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x910, METHOD_BUFFERED, FILE_ANY_ACCESS  )
+#define SET_SCHEME         CTL_CODE( FORENSICS_COLLECTOR_TYPE, 0x911, METHOD_BUFFERED, FILE_ANY_ACCESS  )
 
 #pragma endregion
 
@@ -143,28 +144,28 @@ HANDLE SimulationProcessId = 0;
 //
 // Limited to < 1 microsecond
 // 
-//#define TimeOpStart() {                                             \
-//    LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
-//    LARGE_INTEGER Frequency;                                        \
-//    StartingTime = KeQueryPerformanceCounter(&Frequency);           \
-//
-//#define TimeOpStop(s)                                                \
-//    EndingTime = KeQueryPerformanceCounter(NULL);                   \
-//    ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
-//    ElapsedMicroseconds.QuadPart *= 1000000;                        \
-//    ElapsedMicroseconds.QuadPart /= Frequency.QuadPart;             \
-//    s = ElapsedMicroseconds.QuadPart;                               \
-//    }                                                               
-
 #define TimeOpStart() {                                             \
     LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
-    StartingTime = KeQueryPerformanceCounter(NULL);                 \
+    LARGE_INTEGER Frequency;                                        \
+    StartingTime = KeQueryPerformanceCounter(&Frequency); __debugbreak(); \
 
 #define TimeOpStop(s)                                                \
     EndingTime = KeQueryPerformanceCounter(NULL);                   \
     ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
+    ElapsedMicroseconds.QuadPart *= 1000000;                        \
+    ElapsedMicroseconds.QuadPart /= Frequency.QuadPart;             \
     s = ElapsedMicroseconds.QuadPart;                               \
     }                                                               
+
+//#define TimeOpStart() {                                             \
+//    LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
+//    StartingTime = KeQueryPerformanceCounter(NULL);                 \
+//
+//#define TimeOpStop(s)                                                \
+//    EndingTime = KeQueryPerformanceCounter(NULL);                   \
+//    ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
+//    s = ElapsedMicroseconds.QuadPart;                               \
+//    }                                                               
 
 //
 // Filter Manager event
@@ -173,10 +174,10 @@ HANDLE SimulationProcessId = 0;
 typedef struct _FilterManagerEvent
 {
     LARGE_INTEGER ElapsedMicroseconds;
-} FilterManagerEvent, *PFilterManagerEvent;
+} FilterManagerEvent, * PFilterManagerEvent;
 LONG64 FilterManagerEventIndex = 0;
 LONG64 FilterManagerMisses = 0;
-FilterManagerEvent FilterManagerEvents[MAX_EVENTS+1] = { 0 };
+FilterManagerEvent FilterManagerEvents[MAX_EVENTS + 1] = { 0 };
 
 //
 // Create process event
@@ -187,7 +188,7 @@ typedef struct _CreationEvent
 } CreationEvent, * PCreationEvent;
 LONG64 CreationEventIndex = 0;
 LONG64 CreationEventMisses = 0;
-CreationEvent CreationEvents[MAX_EVENTS+1] = { 0 };
+CreationEvent CreationEvents[MAX_EVENTS + 1] = { 0 };
 
 //
 // Load image event
@@ -198,7 +199,7 @@ typedef struct _LoadImageEvent
 } LoadImageEvent, * PLoadImageEvent;
 LONG64 LoadEventIndex = 0;
 LONG64 LoadEventMisses = 0;
-LoadImageEvent LoadImageEvents[MAX_EVENTS+1] = { 0 };
+LoadImageEvent LoadImageEvents[MAX_EVENTS + 1] = { 0 };
 
 //
 // Object manager event
@@ -209,7 +210,7 @@ typedef struct _ObjectManagerEvent
 } ObjectManagerEvent, * PObjectManagerEvent;
 LONG64 ObjectManagerEventIndex = 0;
 LONG64 ObjectManagerMisses = 0;
-ObjectManagerEvent ObjectManagerEvents[MAX_EVENTS+1] = { 0 };
+ObjectManagerEvent ObjectManagerEvents[MAX_EVENTS + 1] = { 0 };
 
 typedef struct _RegistryManagerEvent
 {
@@ -217,7 +218,7 @@ typedef struct _RegistryManagerEvent
 } RegistryManagerEvent, * PRegistryManagerEvent;
 LONG64 RegistryManagerEventIndex = 0;
 LONG64 RegistryManagerMisses = 0;
-RegistryManagerEvent RegistryManagerEvents[MAX_EVENTS+1] = { 0 };
+RegistryManagerEvent RegistryManagerEvents[MAX_EVENTS + 1] = { 0 };
 
 
 VOID InitializeStatistics()
@@ -314,19 +315,19 @@ ULONG64 GetBaseAddress(char* ModuleName)
         ModuleInformationBuffer = ExAllocatePoolWithTag(NonPagedPool, BufferSize, POOL_TAG);
 
         if (ModuleInformationBuffer == NULL)
-            break; 
+            break;
 
         Status = ZwQuerySystemInformation(SystemModuleInformation, ModuleInformationBuffer, BufferSize, &RequiredBufferSize);
 
         if (Status == STATUS_INFO_LENGTH_MISMATCH)
         {
             ExFreePoolWithTag(ModuleInformationBuffer, POOL_TAG);
-            
+
             //
             // Increase the buffer size by factor 2, and according to the documentation - RequiredBufferSize is unreliable 
             // so we use here a very crude way to increase the buffer
             //
-            BufferSize *= 2; 
+            BufferSize *= 2;
         }
         else if (!NT_SUCCESS(Status))
         {
@@ -397,10 +398,10 @@ typedef struct _EVENT_DATA {
     //
 
     ULONG64 TypeAndFlags;
-    
+
     ULONG64 ProcessId;
     ULONG64 ThreadId;
-    
+
     //
     // Create Process Specific params
     // EPROCESS/Parent PID
@@ -471,7 +472,7 @@ ReleaseAllocatedBufferedEvents()
 
     KeAcquireSpinLock(&BufferedEventsLock, &oldIrql);
 
-    while (!IsListEmpty(&BufferedEventsList)) 
+    while (!IsListEmpty(&BufferedEventsList))
     {
         pList = RemoveHeadList(&BufferedEventsList);
         KeReleaseSpinLock(&BufferedEventsLock, oldIrql);
@@ -521,7 +522,7 @@ PIRP PopPeningIRP(PDEVICE_EXTENSION DeviceExtension)
 {
     PIRP PendingIRP = NULL;
 
-    if (DeviceExtension->PendingIrp) 
+    if (DeviceExtension->PendingIrp)
     {
         PendingIRP = DeviceExtension->PendingIrp;
         DeviceExtension->PendingIrp = NULL;
@@ -553,10 +554,10 @@ VOID ReleaseResources(PDEVICE_EXTENSION DeviceExtension)
     while ((List_Entry = RemoveHeadList(&DeviceExtension->PendingReadOp)) != &DeviceExtension->PendingReadOp)
     {
         UnlockDeviceExtension(DeviceExtension);
-        
+
         PEVENTS_LIST Event = CONTAINING_RECORD(List_Entry, EVENTS_LIST, List);
         ExFreeToNPagedLookasideList(&BufferedEventsAllocationList, Event);
-        
+
         LockDeviceExtension(DeviceExtension);
     }
 
@@ -585,7 +586,7 @@ CreateCloseDispatch(
 {
     PIO_STACK_LOCATION  irpStack;
     NTSTATUS            Status = STATUS_SUCCESS;
-    
+
     PDEVICE_EXTENSION DeviceExtension = DeviceObject->DeviceExtension;
 
     irpStack = IoGetCurrentIrpStackLocation(Irp);
@@ -643,13 +644,13 @@ CancelIRPRoutine(PDEVICE_OBJECT PDeviceObject, PIRP Irp)
     IoReleaseCancelSpinLock(cancelIrql);
 
     PDEVICE_EXTENSION DeviceExtension = PDeviceObject->DeviceExtension;
-    
+
     LockDeviceExtension(DeviceExtension);
 
     //
     // Essential check, we don't do something crazy
     //
-    if (DeviceExtension->PendingIrp == Irp) 
+    if (DeviceExtension->PendingIrp == Irp)
     {
         DeviceExtension->PendingIrp = NULL;
     }
@@ -697,7 +698,7 @@ ReadDispatch(
     if (irpStack)
     {
         PVOID PReadBuffer = Irp->AssociatedIrp.SystemBuffer;
-        ULONG BufferSize  = irpStack->Parameters.Read.Length;
+        ULONG BufferSize = irpStack->Parameters.Read.Length;
 
         //
         // Lets check usermode has enough space and buffer valid
@@ -812,7 +813,7 @@ PendEvent(_In_ PEVENTS_LIST EventList)
     PDEVICE_EXTENSION DeviceExtension = g_pDeviceObject->DeviceExtension;
 
     LockDeviceExtension(DeviceExtension);
-    
+
     if (DeviceExtension->EnableEvents)
     {
         //
@@ -895,59 +896,58 @@ PreOperationCallback(
             FLT_FILE_NAME_QUERY_ALWAYS_ALLOW_CACHE_LOOKUP,
             &FileNameInfo);
     }
-    else 
+    else
     {
         status = STATUS_UNSUCCESSFUL;
     }
 
-    if (NT_SUCCESS(status)) 
+    if (NT_SUCCESS(status))
     {
         FileNameToLog = &FileNameInfo->Name;
 
         FltParseFileNameInformation(FileNameInfo);
     }
 
-    if (NULL != FileNameInfo) 
+    if (NULL != FileNameInfo)
     {
         if (NULL != FileNameToLog)
         {
             DbgPrint("\tPid: 0x%p, FileName: %wZ\n", PsGetCurrentProcessId(), FileNameToLog->Buffer);
-            
-#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
-            PEVENTS_LIST EventList = AllocateBufferedEvent();
 
-            if (EventList != NULL)
+            if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG))
             {
-                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
-                EventList->Event.ThreadId  = (ULONG64)PsGetCurrentThreadId();
-                EventList->Event.TypeAndFlags |= FILTERMGR_EVENT_TYPE;
-                RtlCopyMemory(EventList->Event.Name1, FileNameToLog->Buffer, min(MAX_NAME_SIZE, FileNameToLog->Length));
+                PEVENTS_LIST EventList = AllocateBufferedEvent();
 
-#if USE_BUFFERED_EVENTS
-                RetainEventList(EventList);
-#endif
+                if (EventList != NULL)
+                {
+                    EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                    EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                    EventList->Event.TypeAndFlags |= FILTERMGR_EVENT_TYPE;
+                    RtlCopyMemory(EventList->Event.Name1, FileNameToLog->Buffer, min(MAX_NAME_SIZE, FileNameToLog->Length));
 
-#if USE_COMPLETION_EVENTS
-                PendEvent(EventList);
-#endif
 
+                    if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                        RetainEventList(EventList);
+
+                    if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                        PendEvent(EventList);
+
+                }
             }
-#endif
 
-#if USE_ETW_EVENTS
-            EventWriteFileOp((ULONG64)PsGetCurrentProcessId(), (ULONG64)PsGetCurrentThreadId(), FileNameToLog->Buffer);
-#endif
+            if (FlagOn(gEventScheme, ETW_ON_FLAG))
+                EventWriteFileOp((ULONG64)PsGetCurrentProcessId(), (ULONG64)PsGetCurrentThreadId(), FileNameToLog->Buffer);
+
+            FltReleaseFileNameInformation(FileNameInfo);
         }
 
-        FltReleaseFileNameInformation(FileNameInfo);
+        TimeOpStop(FilterManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+
+        DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, FilterManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+
+    Exit:
+        return Status;
     }
-
-    TimeOpStop(FilterManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-
-    DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, FilterManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-    
-Exit:
-    return Status;
 }
 
 FLT_POSTOP_CALLBACK_STATUS
@@ -1153,7 +1153,7 @@ FCMessage(
             }
 
             *ReturnOutputBufferLength = sizeof(EVENT_DATA);
-            
+
             ExFreeToNPagedLookasideList(&BufferedEventsAllocationList, Event);
         }
         else
@@ -1228,88 +1228,81 @@ PsCreateProcessNotifyRoutineEx2Callback(
         {
             DbgPrint("\tPid: 0x%p, Command line: %wZ\n", ProcessId, CreateInfo->CommandLine);
 
-#if USE_ETW_EVENTS
-            EventWriteCreateOp(
-                (ULONG64)PsGetCurrentProcessId(),
-                (ULONG64)PsGetCurrentThreadId(),
-                (ULONG64)Process,
-                (ULONG64)CreateInfo->ParentProcessId,
-                TRUE, // Create Process
-                (PCWSTR)CreateInfo->CommandLine->Buffer,
-                (PCWSTR)CreateInfo->ImageFileName->Buffer
-            );
-#endif
+            if (FlagOn(gEventScheme, ETW_ON_FLAG))
+                EventWriteCreateOp(
+                    (ULONG64)PsGetCurrentProcessId(),
+                    (ULONG64)PsGetCurrentThreadId(),
+                    (ULONG64)Process,
+                    (ULONG64)CreateInfo->ParentProcessId,
+                    TRUE, // Create Process
+                    (PCWSTR)CreateInfo->CommandLine->Buffer,
+                    (PCWSTR)CreateInfo->ImageFileName->Buffer
+                );
 
-#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
-            PEVENTS_LIST EventList = AllocateBufferedEvent();
+            if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
+                PEVENTS_LIST EventList = AllocateBufferedEvent();
 
-            if (EventList != NULL)
-            {
-                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
-                EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
-                EventList->Event.TypeAndFlags |= CREATEPS_CREATE_BOOL;
-                RtlCopyMemory(EventList->Event.Name1, CreateInfo->CommandLine->Buffer, min(MAX_NAME_SIZE, CreateInfo->CommandLine->Length));
-                RtlCopyMemory(EventList->Event.Name2, CreateInfo->ImageFileName->Buffer, min(MAX_NAME_SIZE, CreateInfo->ImageFileName->Length));
+                if (EventList != NULL)
+                {
+                    EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                    EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                    EventList->Event.TypeAndFlags |= CREATEPS_CREATE_BOOL;
+                    RtlCopyMemory(EventList->Event.Name1, CreateInfo->CommandLine->Buffer, min(MAX_NAME_SIZE, CreateInfo->CommandLine->Length));
+                    RtlCopyMemory(EventList->Event.Name2, CreateInfo->ImageFileName->Buffer, min(MAX_NAME_SIZE, CreateInfo->ImageFileName->Length));
 
-#if USE_BUFFERED_EVENTS
-                RetainEventList(EventList);
-#endif
+                    if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                        RetainEventList(EventList);
 
-#if USE_COMPLETION_EVENTS
-                PendEvent(EventList);
-#endif
+                    if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                        PendEvent(EventList);
+
+                }
 
             }
-#endif
 
+            DbgPrint("\tPid: 0x%p, Image Name: %wZ\n", ProcessId, CreateInfo->ImageFileName);
         }
-
-        DbgPrint("\tPid: 0x%p, Image Name: %wZ\n", ProcessId, CreateInfo->ImageFileName);
-    }
-    else // Process Terminated
-    {
-        DbgPrint("\tProcess Exit: EPROCESS: 0x%p, Pid: 0x%p", Process, ProcessId);
-
-#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
-        PEVENTS_LIST EventList = AllocateBufferedEvent();
-
-        if (EventList != NULL)
+        else // Process Terminated
         {
-            EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
-            EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
-            EventList->Event.TypeAndFlags |= CREATEPS_EVENT_TYPE;
+            DbgPrint("\tProcess Exit: EPROCESS: 0x%p, Pid: 0x%p", Process, ProcessId);
 
-#if USE_BUFFERED_EVENTS
-            RetainEventList(EventList);
-#endif
+            if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
+                PEVENTS_LIST EventList = AllocateBufferedEvent();
 
-#if USE_COMPLETION_EVENTS
-            PendEvent(EventList);
-#endif
+                if (EventList != NULL)
+                {
+                    EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                    EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                    EventList->Event.TypeAndFlags |= CREATEPS_EVENT_TYPE;
 
+                    if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                        RetainEventList(EventList);
+
+                    if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                        PendEvent(EventList);
+
+                }
+            }
+
+            if (FlagOn(gEventScheme, ETW_ON_FLAG))
+                EventWriteCreateOp(
+                    (ULONG64)PsGetCurrentProcessId(),
+                    (ULONG64)PsGetCurrentThreadId(),
+                    (ULONG64)Process,
+                    0,
+                    FALSE, // Create Process
+                    NULL,
+                    NULL
+                );
+
+            TimeOpStop(CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+
+            DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+        Exit:
+            return;
         }
-#endif
-
-#if USE_ETW_EVENTS
-        EventWriteCreateOp(
-            (ULONG64)PsGetCurrentProcessId(),
-            (ULONG64)PsGetCurrentThreadId(),
-            (ULONG64)Process,
-            0,
-            FALSE, // Create Process
-            NULL,
-            NULL
-        );
-#endif
     }
-
-    TimeOpStop(CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-
-    DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-Exit:
-    return;
 }
-
 #pragma endregion
 
 #pragma region Load Image Callback
@@ -1348,44 +1341,40 @@ LoadImageNotifyRoutineCallback(
     {
         DbgPrint("\t%wZ loaded in process 0x%p\n", FullImageName, ProcessId);
 
-#if USE_ETW_EVENTS
-        EventWriteLoadOp(
-            (ULONG64)PsGetCurrentProcessId(),
-            (ULONG64)PsGetCurrentThreadId(),
-            (PCWSTR)FullImageName->Buffer
-        );
-#endif
+        if (FlagOn(gEventScheme, ETW_ON_FLAG))
+            EventWriteLoadOp(
+                (ULONG64)PsGetCurrentProcessId(),
+                (ULONG64)PsGetCurrentThreadId(),
+                (PCWSTR)FullImageName->Buffer
+            );
 
-#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
-        PEVENTS_LIST EventList = AllocateBufferedEvent();
+        if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
+            PEVENTS_LIST EventList = AllocateBufferedEvent();
 
-        if (EventList != NULL)
-        {
-            EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
-            EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
-            EventList->Event.TypeAndFlags |= LOADIMAGE_EVENT_TYPE;
-            RtlCopyMemory(EventList->Event.Name1, FullImageName->Buffer, min(MAX_NAME_SIZE, FullImageName->Length));
+            if (EventList != NULL)
+            {
+                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                EventList->Event.TypeAndFlags |= LOADIMAGE_EVENT_TYPE;
+                RtlCopyMemory(EventList->Event.Name1, FullImageName->Buffer, min(MAX_NAME_SIZE, FullImageName->Length));
 
-#if USE_BUFFERED_EVENTS
-            RetainEventList(EventList);
-#endif
+                if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                    RetainEventList(EventList);
 
-#if USE_COMPLETION_EVENTS
-            PendEvent(EventList);
-#endif
+                if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                    PendEvent(EventList);
+
+            }
 
         }
-#endif
 
+        TimeOpStop(LoadImageEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+
+        DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, LoadImageEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+    Exit:
+        return;
     }
-
-    TimeOpStop(LoadImageEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-
-    DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, LoadImageEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-Exit:
-    return;
 }
-
 #pragma endregion
 
 #pragma region Object Manager Callback
@@ -1407,47 +1396,47 @@ OB_CALLBACK_CONTEXT ObCallbackContext;
 PWCHAR
 ObjectManagerObjectTypeToString(POBJECT_TYPE ObjectType)
 {
-    if (ObjectType == *IoFileObjectType) 
+    if (ObjectType == *IoFileObjectType)
     {
         return L"IoFileObjectType";
     }
-    
-    if (ObjectType == *ExEventObjectType) 
+
+    if (ObjectType == *ExEventObjectType)
     {
         return L"ExEventObjectType";
     }
-    
-    if (ObjectType == *ExSemaphoreObjectType) 
+
+    if (ObjectType == *ExSemaphoreObjectType)
     {
         return L"ExSemaphoreObjectType";
     }
-    
-    if (ObjectType == *TmTransactionManagerObjectType) 
+
+    if (ObjectType == *TmTransactionManagerObjectType)
     {
         return L"TmTransactionManagerObjectType";
     }
-    
-    if (ObjectType == *TmResourceManagerObjectType) 
+
+    if (ObjectType == *TmResourceManagerObjectType)
     {
         return L"TmResourceManagerObjectType";
     }
-    
-    if (ObjectType == *TmEnlistmentObjectType) 
+
+    if (ObjectType == *TmEnlistmentObjectType)
     {
         return L"TmEnlistmentObjectType";
     }
-    
-    if (ObjectType == *TmTransactionObjectType) 
+
+    if (ObjectType == *TmTransactionObjectType)
     {
         return L"TmTransactionObjectType";
     }
-    
-    if (ObjectType == *PsProcessType) 
+
+    if (ObjectType == *PsProcessType)
     {
         return L"PsProcessType";
     }
-    
-    if (ObjectType == *PsThreadType) 
+
+    if (ObjectType == *PsThreadType)
     {
         return L"PsThreadType";
     }
@@ -1488,20 +1477,20 @@ ObjectManagerPreCallback(
 
     OperationParams = OperationInformation->Parameters;
 
-    switch (OperationInformation->Operation) 
+    switch (OperationInformation->Operation)
     {
-        case OB_OPERATION_HANDLE_CREATE: 
-        {
+    case OB_OPERATION_HANDLE_CREATE:
+    {
 
-            CreateParams = &OperationParams->CreateHandleInformation;
+        CreateParams = &OperationParams->CreateHandleInformation;
 
-            DbgPrint("\tPre %s handle open 0x%p (%ls). Desired access is 0x%x\n",
-                OperationInformation->KernelHandle ? "Kernel" : "User",
-                OperationInformation->Object,
-                ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
-                CreateParams->OriginalDesiredAccess);
+        DbgPrint("\tPre %s handle open 0x%p (%ls). Desired access is 0x%x\n",
+            OperationInformation->KernelHandle ? "Kernel" : "User",
+            OperationInformation->Object,
+            ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
+            CreateParams->OriginalDesiredAccess);
 
-#if USE_ETW_EVENTS
+        if (FlagOn(gEventScheme, ETW_ON_FLAG))
             EventWriteObjectOp(
                 (ULONG64)PsGetCurrentProcessId(),
                 (ULONG64)PsGetCurrentThreadId(),
@@ -1511,9 +1500,8 @@ ObjectManagerPreCallback(
                 (ULONG64)CreateParams->OriginalDesiredAccess,
                 (BOOLEAN)OperationInformation->Operation
             );
-#endif
 
-#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
+        if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
             PEVENTS_LIST EventList = AllocateBufferedEvent();
 
             if (EventList != NULL)
@@ -1527,35 +1515,32 @@ ObjectManagerPreCallback(
                 PWCHAR ObjectTypeRequested = ObjectManagerObjectTypeToString(OperationInformation->ObjectType);
                 RtlCopyMemory(EventList->Event.Name1, ObjectTypeRequested, min(MAX_NAME_SIZE, wcslen(ObjectTypeRequested)));
 
-#if USE_BUFFERED_EVENTS
-                RetainEventList(EventList);
-#endif
+                if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                    RetainEventList(EventList);
 
-#if USE_COMPLETION_EVENTS
-                PendEvent(EventList);
-#endif
+                if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                    PendEvent(EventList);
 
             }
-#endif
-
-            break;
         }
-        case OB_OPERATION_HANDLE_DUPLICATE: 
-        {
-        
-            DuplicateHandleParams = &OperationParams->DuplicateHandleInformation;
+        break;
+    }
+    case OB_OPERATION_HANDLE_DUPLICATE:
+    {
 
-            DbgPrint("\tPre %s handle duplicate 0x%p (%ls). Desired access is 0x%x. From 0x%p to 0x%p Process\n",
-                OperationInformation->KernelHandle ? "Kernel" : "User",
-                OperationInformation->Object,
-                ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
-                DuplicateHandleParams->OriginalDesiredAccess,
-                DuplicateHandleParams->SourceProcess,
-                DuplicateHandleParams->TargetProcess);
+        DuplicateHandleParams = &OperationParams->DuplicateHandleInformation;
+
+        DbgPrint("\tPre %s handle duplicate 0x%p (%ls). Desired access is 0x%x. From 0x%p to 0x%p Process\n",
+            OperationInformation->KernelHandle ? "Kernel" : "User",
+            OperationInformation->Object,
+            ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
+            DuplicateHandleParams->OriginalDesiredAccess,
+            DuplicateHandleParams->SourceProcess,
+            DuplicateHandleParams->TargetProcess);
 
 
-            // TODO(Kostya) consider adding duplicate event            
-#if USE_ETW_EVENTS
+        // TODO(Kostya) consider adding duplicate event            
+        if (FlagOn(gEventScheme, ETW_ON_FLAG))
             EventWriteObjectOp(
                 (ULONG64)PsGetCurrentProcessId(),
                 (ULONG64)PsGetCurrentThreadId(),
@@ -1565,9 +1550,8 @@ ObjectManagerPreCallback(
                 (ULONG64)DuplicateHandleParams->OriginalDesiredAccess,
                 (BOOLEAN)OperationInformation->Operation
             );
-#endif
 
-#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
+        if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
             PEVENTS_LIST EventList = AllocateBufferedEvent();
 
             if (EventList != NULL)
@@ -1581,33 +1565,30 @@ ObjectManagerPreCallback(
                 PWCHAR ObjectTypeRequested = ObjectManagerObjectTypeToString(OperationInformation->ObjectType);
                 RtlCopyMemory(EventList->Event.Name1, ObjectTypeRequested, min(MAX_NAME_SIZE, wcslen(ObjectTypeRequested)));
 
-#if USE_BUFFERED_EVENTS
-                RetainEventList(EventList);
-#endif
+                if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                    RetainEventList(EventList);
 
-#if USE_COMPLETION_EVENTS
-                PendEvent(EventList);
-#endif
+                if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                    PendEvent(EventList);
 
             }
-#endif
+        }
+        break;
+    }
 
-            break;
-        }
-  
-        default: 
-        {
-            DbgPrint("\tUnknown operation 0x%x!\n",
-                OperationInformation->Operation);
-            break;
-        }
+    default:
+    {
+        DbgPrint("\tUnknown operation 0x%x!\n",
+            OperationInformation->Operation);
+        break;
+    }
     }
 
     TimeOpStop(ObjectManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 
     DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, ObjectManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 Exit:
-   
+
     return OB_PREOP_SUCCESS;
 }
 
@@ -1633,44 +1614,44 @@ ObjectManagerPostCallback(
 
     OperationParams = OperationInformation->Parameters;
 
-    switch (OperationInformation->Operation) 
+    switch (OperationInformation->Operation)
     {
-        case OB_OPERATION_HANDLE_CREATE: 
-        {
+    case OB_OPERATION_HANDLE_CREATE:
+    {
 
-            CreateParams = &OperationParams->CreateHandleInformation;
+        CreateParams = &OperationParams->CreateHandleInformation;
 
-            //
-            // Granted access might be truncted comparing to the original request
-            // this is the favourite way by AM software to ensure "security"
-            //
-            DbgPrint("\tPost %s handle creation to object 0x%p (%ls). Result was 0x%x, Granted Access 0x%x\n",
-                OperationInformation->KernelHandle ? "Kernel" : "User",
-                OperationInformation->Object,
-                ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
-                OperationInformation->ReturnStatus,
-                CreateParams->GrantedAccess);
-            break;
-        }
-        case OB_OPERATION_HANDLE_DUPLICATE: 
-        {
-            DuplicateParams = &OperationParams->DuplicateHandleInformation;
-            DbgPrint("\tPost %s Handle duplication to object 0x%p (%ls). Result was 0x%x Granted Access 0x%x\n",
-                OperationInformation->KernelHandle ? "Kernel" : "User",
-                OperationInformation->Object,
-                ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
-                OperationInformation->ReturnStatus,
-                DuplicateParams->GrantedAccess);
-            break;
-        }
-        default: 
-        {
-            DbgPrint("\tUnknown operation 0x%x!\n",
-                OperationInformation->Operation);
-            break;
-        }
+        //
+        // Granted access might be truncted comparing to the original request
+        // this is the favourite way by AM software to ensure "security"
+        //
+        DbgPrint("\tPost %s handle creation to object 0x%p (%ls). Result was 0x%x, Granted Access 0x%x\n",
+            OperationInformation->KernelHandle ? "Kernel" : "User",
+            OperationInformation->Object,
+            ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
+            OperationInformation->ReturnStatus,
+            CreateParams->GrantedAccess);
+        break;
     }
-    
+    case OB_OPERATION_HANDLE_DUPLICATE:
+    {
+        DuplicateParams = &OperationParams->DuplicateHandleInformation;
+        DbgPrint("\tPost %s Handle duplication to object 0x%p (%ls). Result was 0x%x Granted Access 0x%x\n",
+            OperationInformation->KernelHandle ? "Kernel" : "User",
+            OperationInformation->Object,
+            ObjectManagerObjectTypeToString(OperationInformation->ObjectType),
+            OperationInformation->ReturnStatus,
+            DuplicateParams->GrantedAccess);
+        break;
+    }
+    default:
+    {
+        DbgPrint("\tUnknown operation 0x%x!\n",
+            OperationInformation->Operation);
+        break;
+    }
+    }
+
     DbgPrint("<-- %s", __FUNCTION__);
 
 Exit:
@@ -1819,43 +1800,39 @@ CmRegistryCallback(
     // Registry notificationsn classes are documented in below msdn page
     // See: https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ne-wdm-_reg_notify_class
     //
- 
+
     RegistryNotifyClass = (REG_NOTIFY_CLASS)PtrToUlong(Argument1);
 
     DbgPrint("CmRegistryCallback: Called for %ls (0x%x)\n",
         RegNotifyClassToString(RegistryNotifyClass), RegistryNotifyClass);
 
-#if USE_ETW_EVENTS
-    EventWriteRegOp(
-        (ULONG64)PsGetCurrentProcessId(),
-        (ULONG64)PsGetCurrentThreadId(),
-        RegNotifyClassToString(RegistryNotifyClass),
-        (ULONG64)RegistryNotifyClass
-    );
-#endif
+    if (FlagOn(gEventScheme, ETW_ON_FLAG))
+        EventWriteRegOp(
+            (ULONG64)PsGetCurrentProcessId(),
+            (ULONG64)PsGetCurrentThreadId(),
+            RegNotifyClassToString(RegistryNotifyClass),
+            (ULONG64)RegistryNotifyClass
+        );
 
-#if USE_BUFFERED_EVENTS || USE_COMPLETION_EVENTS
-    PEVENTS_LIST EventList = AllocateBufferedEvent();
+    if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
+        PEVENTS_LIST EventList = AllocateBufferedEvent();
 
-    if (EventList != NULL)
-    {
-        EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
-        EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
-        EventList->Event.TypeAndFlags |= REG_MNGR_EVENT_TYPE;
-        PWCHAR NotificationClass = RegNotifyClassToString(RegistryNotifyClass);
-        RtlCopyMemory(EventList->Event.Name1, NotificationClass, min(MAX_NAME_SIZE, wcslen(NotificationClass)));
+        if (EventList != NULL)
+        {
+            EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+            EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+            EventList->Event.TypeAndFlags |= REG_MNGR_EVENT_TYPE;
+            PWCHAR NotificationClass = RegNotifyClassToString(RegistryNotifyClass);
+            RtlCopyMemory(EventList->Event.Name1, NotificationClass, min(MAX_NAME_SIZE, wcslen(NotificationClass)));
 
-#if USE_BUFFERED_EVENTS
-        RetainEventList(EventList);
-#endif
+            if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                RetainEventList(EventList);
 
-#if USE_COMPLETION_EVENTS
-        PendEvent(EventList);
-#endif
+            if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                PendEvent(EventList);
 
+        }
     }
-#endif
-
     TimeOpStop(RegistryManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
 
     DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, RegistryManagerEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
@@ -1879,7 +1856,7 @@ BOOLEAN FltCommunicationPortRegistered = FALSE;
 
 VOID UnregisterAllCallbacks()
 {
-    if (CmCallbackContext.CallbackRegistered == TRUE) 
+    if (CmCallbackContext.CallbackRegistered == TRUE)
     {
         ASSERT_NT_SUCCESS(
             CmUnRegisterCallback(
@@ -1929,8 +1906,8 @@ VOID UnregisterAllCallbacks()
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     NTSTATUS                   Status = STATUS_SUCCESS;
-    UNICODE_STRING             DeviceUnicodeString;    
-    UNICODE_STRING             Win32NameString;    
+    UNICODE_STRING             DeviceUnicodeString;
+    UNICODE_STRING             Win32NameString;
     PDEVICE_OBJECT             DeviceObject = NULL;
     OB_CALLBACK_REGISTRATION   ObjectManagerCallbackRegistration;
     POB_OPERATION_REGISTRATION ObjectManagerOperationRegistration = NULL;
@@ -1980,7 +1957,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     //
 
     DriverObject->MajorFunction[IRP_MJ_CREATE] = CreateCloseDispatch;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE]  = CreateCloseDispatch;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = CreateCloseDispatch;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceControlDispatch;
 
     //
@@ -2007,7 +1984,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     RtlInitUnicodeString(&Win32NameString, DOS_DEVICE_NAME);
 
     Status = IoCreateSymbolicLink(
-        &Win32NameString, 
+        &Win32NameString,
         &DeviceUnicodeString
     );
 
@@ -2030,10 +2007,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     //
     // Register ETW events
-    //
-#if USE_ETW_EVENTS
+    //							 
     EventRegisterForensics_Collector_Provider();
-#endif
 
 
     //
@@ -2061,7 +2036,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         &FPFilterManagerContext.Filter
     );
 
-    if (!NT_SUCCESS(Status)) 
+    if (!NT_SUCCESS(Status))
     {
         DbgPrint(("Couldn't \"attach\" to filter manager\n"));
         goto Exit;
@@ -2073,7 +2048,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     Status = FltBuildDefaultSecurityDescriptor(&sd,
         FLT_PORT_ALL_ACCESS);
 
-    if (!NT_SUCCESS(Status)) 
+    if (!NT_SUCCESS(Status))
     {
         DbgPrint(("Couldn't create port default security description\n"));
         goto Exit;
@@ -2100,7 +2075,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     FltFreeSecurityDescriptor(sd);
 
-    if (!NT_SUCCESS(Status)) 
+    if (!NT_SUCCESS(Status))
     {
         DbgPrint(("Could not create Flt communication port\n"));
         goto Exit;
@@ -2149,7 +2124,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
 
     LoadImageNotifyRoutineRegistered = TRUE; // remember for unload routine
-    
+
     //
     // Object Manager registration
     //
@@ -2169,10 +2144,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     // Refered to: https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/allocated-altitudes
     // To pick a suitable altitude
     //
-    RtlInitUnicodeString(&ObjectManagerCallbackRegistration.Altitude, L"84666"); 
+    RtlInitUnicodeString(&ObjectManagerCallbackRegistration.Altitude, L"84666");
 
     ObjectManagerCallbackTypesSize = (sizeof(OB_OPERATION_REGISTRATION) * 2 /*Pre+Post*/);
-    
+
     //
     // Allocate memory for Object manager rgistration structure
     //
@@ -2195,9 +2170,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     // Fill the Callback information and register them
     //
 
-    for (ULONG i = 0; i < 2; i++) 
+    for (ULONG i = 0; i < 2; i++)
     {
-        ObjectManagerOperationRegistration[i].Operations = 
+        ObjectManagerOperationRegistration[i].Operations =
             OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
 
         ObjectManagerOperationRegistration[i].PreOperation = ObjectManagerPreCallback;
@@ -2205,12 +2180,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
 
     ObjectManagerOperationRegistration[0 /*Process Object*/].ObjectType = PsProcessType;
-    ObjectManagerOperationRegistration[1 /*Thread Object*/].ObjectType  = PsThreadType;
+    ObjectManagerOperationRegistration[1 /*Thread Object*/].ObjectType = PsThreadType;
 
     Status = ObRegisterCallbacks(&ObjectManagerCallbackRegistration,
         &ObCallbackContext.RegistrationHandle);
 
-    if (!NT_SUCCESS(Status)) 
+    if (!NT_SUCCESS(Status))
     {
         DbgPrint("Forensics Collector : ObRegisterCallbacks failed! Status 0x%x\n", Status);
         goto Exit;
@@ -2223,7 +2198,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     // Registry notifiation callbacks
     //
     CmCallbackContext.MagicNumber = CM_CALLBACK_CONTEXT_MAGIC;
-    
+
     RtlInitUnicodeString(&CmAltitude,
         L"17000");
 
@@ -2275,9 +2250,7 @@ VOID DriverUnloadFunction(PDRIVER_OBJECT DriverObject)
 
     ReleaseStatistics();
 
-#if USE_BUFFERED_EVENTS
     ReleaseAllocatedBufferedEvents();
-#endif
 
     if (DriverSymbolicLinkRegistered == TRUE)
     {
@@ -2312,9 +2285,7 @@ VOID DriverUnloadFunction(PDRIVER_OBJECT DriverObject)
     }
 
 
-#if USE_ETW_EVENTS
     EventUnregisterForensics_Collector_Provider();
-#endif
 }
 
 NTSTATUS
@@ -2325,10 +2296,10 @@ DeviceControlDispatch(
 {
     PIO_STACK_LOCATION  IrpSp;// Pointer to current stack location
     NTSTATUS            Status = STATUS_SUCCESS;// Assume success
-    
+
     ULONG               InputBufferLength;
     ULONG               OutputBufferLength;
-        
+
     UNREFERENCED_PARAMETER(DeviceObject);
 
     IrpSp = IoGetCurrentIrpStackLocation(Irp);
@@ -2456,7 +2427,7 @@ DeviceControlDispatch(
         }
 
         PVOID OutputBuffer = Irp->AssociatedIrp.SystemBuffer;
-        
+
         RtlCopyBytes(OutputBuffer, &FilterManagerMisses, sizeof(ULONG64));
 
         OutputBuffer = Add2Ptr(OutputBuffer, sizeof(ULONG64));
@@ -2515,6 +2486,22 @@ DeviceControlDispatch(
         InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
 
         SimulationProcessId = *(HANDLE*)InputBuffer;
+
+        Irp->IoStatus.Information = 0;
+    } break;
+
+    case SET_SCHEME:
+    {
+        if (InputBufferLength != sizeof(ULONG64))
+        {
+            Status = STATUS_INVALID_PARAMETER;
+            goto End;
+        }
+
+        ULONG64 InputBuffer;
+        InputBuffer = (ULONG64)Irp->AssociatedIrp.SystemBuffer;
+
+        gEventScheme = *(ULONG64*)InputBuffer;
 
         Irp->IoStatus.Information = 0;
     } break;
