@@ -1,5 +1,5 @@
 //
-// Copyright 2021 Nina Tessler and Kostya Zhuruev.
+// Copyright 2022 Nina Tessler and Kostya Zhuruev.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -144,28 +144,28 @@ HANDLE SimulationProcessId = 0;
 //
 // Limited to < 1 microsecond
 // 
-#define TimeOpStart() {                                             \
-    LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
-    LARGE_INTEGER Frequency;                                        \
-    StartingTime = KeQueryPerformanceCounter(&Frequency); __debugbreak(); \
-
-#define TimeOpStop(s)                                                \
-    EndingTime = KeQueryPerformanceCounter(NULL);                   \
-    ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
-    ElapsedMicroseconds.QuadPart *= 1000000;                        \
-    ElapsedMicroseconds.QuadPart /= Frequency.QuadPart;             \
-    s = ElapsedMicroseconds.QuadPart;                               \
-    }                                                               
-
 //#define TimeOpStart() {                                             \
-//    LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
-//    StartingTime = KeQueryPerformanceCounter(NULL);                 \
+//    LARGE_INTEGER StartingTime = {0}, EndingTime = {0}, ElapsedMicroseconds = {0};    \
+//    LARGE_INTEGER Frequency;                                        \
+//    StartingTime = KeQueryPerformanceCounter(&Frequency);           \
 //
 //#define TimeOpStop(s)                                                \
 //    EndingTime = KeQueryPerformanceCounter(NULL);                   \
 //    ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
+//    ElapsedMicroseconds.QuadPart *= 1000000;                        \
+//    ElapsedMicroseconds.QuadPart /= Frequency.QuadPart;             \
 //    s = ElapsedMicroseconds.QuadPart;                               \
 //    }                                                               
+
+#define TimeOpStart() {                                             \
+    LARGE_INTEGER StartingTime, EndingTime, ElapsedMicroseconds;    \
+    StartingTime = KeQueryPerformanceCounter(NULL);                 \
+
+#define TimeOpStop(s)                                                \
+    EndingTime = KeQueryPerformanceCounter(NULL);                   \
+    ElapsedMicroseconds.QuadPart = EndingTime.QuadPart - StartingTime.QuadPart; \
+    s = ElapsedMicroseconds.QuadPart;                               \
+    }                                                               
 
 //
 // Filter Manager event
@@ -1262,46 +1262,48 @@ PsCreateProcessNotifyRoutineEx2Callback(
 
             DbgPrint("\tPid: 0x%p, Image Name: %wZ\n", ProcessId, CreateInfo->ImageFileName);
         }
-        else // Process Terminated
-        {
-            DbgPrint("\tProcess Exit: EPROCESS: 0x%p, Pid: 0x%p", Process, ProcessId);
-
-            if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
-                PEVENTS_LIST EventList = AllocateBufferedEvent();
-
-                if (EventList != NULL)
-                {
-                    EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
-                    EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
-                    EventList->Event.TypeAndFlags |= CREATEPS_EVENT_TYPE;
-
-                    if (FlagOn(gEventScheme, FLT_ON_FLAG))
-                        RetainEventList(EventList);
-
-                    if (FlagOn(gEventScheme, CMT_ON_FLAG))
-                        PendEvent(EventList);
-
-                }
-            }
-
-            if (FlagOn(gEventScheme, ETW_ON_FLAG))
-                EventWriteCreateOp(
-                    (ULONG64)PsGetCurrentProcessId(),
-                    (ULONG64)PsGetCurrentThreadId(),
-                    (ULONG64)Process,
-                    0,
-                    FALSE, // Create Process
-                    NULL,
-                    NULL
-                );
-
-            TimeOpStop(CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-
-            DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
-        Exit:
-            return;
-        }
     }
+    else // Process Terminated
+    {
+        DbgPrint("\tProcess Exit: EPROCESS: 0x%p, Pid: 0x%p", Process, ProcessId);
+
+        if (FlagOn(gEventScheme, CMT_ON_FLAG) || FlagOn(gEventScheme, FLT_ON_FLAG)) {
+            PEVENTS_LIST EventList = AllocateBufferedEvent();
+
+            if (EventList != NULL)
+            {
+                EventList->Event.ProcessId = (ULONG64)PsGetCurrentProcessId();
+                EventList->Event.ThreadId = (ULONG64)PsGetCurrentThreadId();
+                EventList->Event.TypeAndFlags |= CREATEPS_EVENT_TYPE;
+
+                if (FlagOn(gEventScheme, FLT_ON_FLAG))
+                    RetainEventList(EventList);
+
+                if (FlagOn(gEventScheme, CMT_ON_FLAG))
+                    PendEvent(EventList);
+
+            }
+        }
+
+        if (FlagOn(gEventScheme, ETW_ON_FLAG))
+            EventWriteCreateOp(
+                (ULONG64)PsGetCurrentProcessId(),
+                (ULONG64)PsGetCurrentThreadId(),
+                (ULONG64)Process,
+                0,
+                FALSE, // Create Process
+                NULL,
+                NULL
+            );
+
+    }
+
+    TimeOpStop(CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+
+    DbgPrint("<-- %s (%I64u)\n", __FUNCTION__, CreationEvents[CurrentEventIndex].ElapsedMicroseconds.QuadPart);
+Exit:
+    return;
+
 }
 #pragma endregion
 
